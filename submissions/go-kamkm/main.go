@@ -98,7 +98,7 @@ func main() {
 		}
 	}
 
-	log.Printf("go-luna listening on %v (postgres pool %d)", ports, poolSize)
+	log.Printf("go-kamkm listening on %v (postgres pool %d)", ports, poolSize)
 	var wait sync.WaitGroup
 	serveErrors := make(chan error, len(servers))
 	for i := range servers {

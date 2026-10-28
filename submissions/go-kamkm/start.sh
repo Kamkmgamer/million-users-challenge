@@ -14,4 +14,4 @@ if [ -z "${GOMEMLIMIT:-}" ]; then
     export GOMEMLIMIT="$((memory_kib * 75 / 100))KiB"
   fi
 fi
-exec "$DIR/bin/feed-go-luna"
+exec "$DIR/bin/feed-go-kamkm"
