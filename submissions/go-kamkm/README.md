@@ -13,4 +13,5 @@ The process consumes `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, `EXTRA_PORT`,
 - Routing is a single allocation-light dispatcher for the five paths. Authentication is checked before the like endpoint parses its post ID.
 - JWTs are verified on every authenticated request with a constant-time HMAC-SHA256 comparison, an exact `HS256` algorithm check, and a required unexpired `exp` claim. The `sub` claim must be a positive decimal string.
 - Database statements are the queries from `SPEC.md`, issued through one shared pool. Query contexts have a five-second bound, and missing-post likes are translated from the post foreign-key error.
+- Authenticated writes enter a bounded 64-item batcher and share one transaction/commit; a failed batch is rolled back and retried individually so per-request errors remain correct.
 - Responses use ordered Go structs and UTC millisecond formatting. Gzip response buffers and writers are pooled only for the duration of a response, so idle keep-alive connections do not retain compression state.
