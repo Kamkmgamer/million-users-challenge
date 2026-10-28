@@ -72,7 +72,7 @@ func main() {
 	}
 	defer db.Close()
 
-	application := &application{db: db, secret: []byte(jwtSecret), started: time.Now()}
+	application := &application{db: db, writes: newWriteBatcher(db), secret: []byte(jwtSecret), started: time.Now()}
 	host := valueOr("HOST", defaultHost)
 	port := valueOr("PORT", defaultPort)
 	ports := []string{port}

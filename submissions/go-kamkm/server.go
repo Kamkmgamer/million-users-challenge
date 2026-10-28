@@ -19,7 +19,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,6 +36,7 @@ const postQuery = `SELECT p.id, p.body, p.created_at, u.username,
 
 type application struct {
 	db      *pgxpool.Pool
+	writes  *writeBatcher
 	secret  []byte
 	started time.Time
 }
@@ -207,22 +207,12 @@ func (a *application) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := queryContext(r.Context())
-	defer cancel()
-	var post postJSON
-	post.Body = body
-	post.Author = user.username
-	var created time.Time
-	err := a.db.QueryRow(ctx,
-		"INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
-		user.id, body,
-	).Scan(&post.ID, &created)
-	if err != nil {
+	result := a.writes.submit(r.Context(), writeJob{kind: writeCreate, userID: user.id, username: user.username, body: body})
+	if result.err != nil {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
-	post.CreatedAt = formatCreated(created)
-	writeJSON(w, r, http.StatusCreated, postEnvelope{Post: post})
+	writeJSON(w, r, http.StatusCreated, postEnvelope{Post: result.post})
 }
 
 func (a *application) like(w http.ResponseWriter, r *http.Request, rawID string) {
@@ -237,23 +227,17 @@ func (a *application) like(w http.ResponseWriter, r *http.Request, rawID string)
 		return
 	}
 
-	ctx, cancel := queryContext(r.Context())
-	defer cancel()
-	tag, err := a.db.Exec(ctx,
-		"INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
-		user.id, id,
-	)
-	if err != nil {
-		var pgError *pgconn.PgError
-		if errors.As(err, &pgError) && pgError.Code == "23503" && pgError.ConstraintName == "likes_post_id_fkey" {
-			writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "post not found"})
-			return
-		}
+	result := a.writes.submit(r.Context(), writeJob{kind: writeLike, userID: user.id, postID: id})
+	if result.notFound {
+		writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "post not found"})
+		return
+	}
+	if result.err != nil {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
 	status = http.StatusOK
-	inserted := tag.RowsAffected() != 0
+	inserted := result.inserted
 	if inserted {
 		status = http.StatusCreated
 	}
