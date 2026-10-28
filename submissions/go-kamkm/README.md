@@ -1,4 +1,4 @@
-# Go Luna feed server
+# Go Kamkm feed server
 
 A compact Go 1.27.1 `net/http` server backed by `github.com/jackc/pgx/v5` 5.11.0's native `pgxpool`. It serves both configured ports from one process, keeps HTTP/1.1 connections alive for 180 seconds, and disables TCP keep-alive probes so idle application connections do not generate a packet every few seconds.
 
