@@ -1386,7 +1386,7 @@ pub fn main() !void {
     // host has eight CPUs and naturally settles at eight; the official
     // sixteen-CPU box gets sixteen independent DB sessions. DB_POOL remains
     // available for deployments with a different database limit.
-    var workers: usize = @min(@as(usize, 16), std.Thread.getCpuCount() catch @as(usize, 1));
+    var workers: usize = 16;
     if (std.posix.getenv("DB_POOL")) |value| workers = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
     if (workers == 0 or workers > 512) return error.Configuration;
 
