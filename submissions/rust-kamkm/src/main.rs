@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use http_body_util::{BodyExt, Full};
@@ -23,10 +23,12 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
-use tokio_postgres::{error::SqlState, NoTls, Row};
+use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
 
 const FEED_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
 const POST_BY_ID_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1";
+const INSERT_POST_SQL: &str = "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
+const INSERT_LIKE_SQL: &str = "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING";
 const MAX_REQUEST_BODY: usize = 16 * 1024;
 
 type HttpBody = Full<Bytes>;
@@ -262,7 +264,17 @@ impl AppState {
                 )
             }
         };
-        let rows = match client.query(FEED_SQL, &[]).await {
+        let statement = match client.prepare_cached(FEED_SQL).await {
+            Ok(statement) => statement,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
+                    gzip,
+                )
+            }
+        };
+        let rows = match client.query(&statement, &[]).await {
             Ok(rows) => rows,
             Err(_) => {
                 return error_response(
@@ -299,7 +311,17 @@ impl AppState {
                 )
             }
         };
-        let row = match client.query_opt(POST_BY_ID_SQL, &[&id]).await {
+        let statement = match client.prepare_cached(POST_BY_ID_SQL).await {
+            Ok(statement) => statement,
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
+                    gzip,
+                )
+            }
+        };
+        let row = match client.query_opt(&statement, &[&id]).await {
             Ok(row) => row,
             Err(_) => {
                 return error_response(
@@ -403,6 +425,24 @@ async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
             return;
         }
     };
+    let insert_statement = match client.prepare_cached(INSERT_POST_SQL).await {
+        Ok(statement) => statement,
+        Err(_) => {
+            for job in batch {
+                process_one_write(pool, job).await;
+            }
+            return;
+        }
+    };
+    let like_statement = match client.prepare_cached(INSERT_LIKE_SQL).await {
+        Ok(statement) => statement,
+        Err(_) => {
+            for job in batch {
+                process_one_write(pool, job).await;
+            }
+            return;
+        }
+    };
     let tx = match client.transaction().await {
         Ok(tx) => tx,
         Err(_) => {
@@ -415,7 +455,7 @@ async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
     let mut results = Vec::with_capacity(batch.len());
     let mut failed = false;
     for job in &batch {
-        match execute_write(&tx, &job.kind).await {
+        match execute_write(&tx, &job.kind, &insert_statement, &like_statement).await {
             Ok(result) => results.push(result),
             Err(_) => {
                 failed = true;
@@ -444,11 +484,19 @@ async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
 async fn process_one_write(pool: &Pool, job: WriteJob) {
     let outcome = async {
         let mut client = pool_client(pool).await.map_err(|_| WriteFailure::Other)?;
+        let insert_statement = client
+            .prepare_cached(INSERT_POST_SQL)
+            .await
+            .map_err(|_| WriteFailure::Other)?;
+        let like_statement = client
+            .prepare_cached(INSERT_LIKE_SQL)
+            .await
+            .map_err(|_| WriteFailure::Other)?;
         let tx = client
             .transaction()
             .await
             .map_err(|_| WriteFailure::Other)?;
-        let result = execute_write(&tx, &job.kind).await;
+        let result = execute_write(&tx, &job.kind, &insert_statement, &like_statement).await;
         match result {
             Ok(outcome) => {
                 tx.commit().await.map_err(|_| WriteFailure::Other)?;
@@ -471,6 +519,8 @@ async fn process_one_write(pool: &Pool, job: WriteJob) {
 async fn execute_write(
     tx: &tokio_postgres::Transaction<'_>,
     kind: &WriteKind,
+    insert_statement: &Statement,
+    like_statement: &Statement,
 ) -> Result<WriteOutcome, WriteFailure> {
     match kind {
         WriteKind::Create {
@@ -479,10 +529,7 @@ async fn execute_write(
             body,
         } => {
             let row = tx
-                .query_one(
-                    "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
-                    &[user_id, body],
-                )
+                .query_one(insert_statement, &[user_id, body])
                 .await
                 .map_err(|_| WriteFailure::Other)?;
             let created_at: DateTime<Utc> = row.get(1);
@@ -495,10 +542,7 @@ async fn execute_write(
             }))
         }
         WriteKind::Like { user_id, post_id } => {
-            let inserted = tx.execute(
-                "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
-                &[user_id, post_id],
-            ).await.map_err(|err| {
+            let inserted = tx.execute(like_statement, &[user_id, post_id]).await.map_err(|err| {
                 if err.as_db_error().is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION) {
                     WriteFailure::NotFound
                 } else { WriteFailure::Other }
@@ -803,7 +847,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(1);
     // Keep PostgreSQL backend count near useful CPU parallelism. A large
     // pool only adds contention on the shared database; DB_POOL overrides it.
-    let default_pool = cores.min(8).max(1);
+    let default_pool = cores.min(16).max(1);
     let pool_size = match env::var("DB_POOL") {
         Ok(value) => value
             .parse::<usize>()
