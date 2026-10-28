@@ -1,4 +1,4 @@
-# rust-luna
+# rust-kamkm
 
 Rust feed API implementation for `SPEC.md`.
 
@@ -37,3 +37,5 @@ Run the repository's validation suite against a fresh `feed_seed` clone with:
 bash test/run.sh submissions/rust-luna
 ```
 
+
+Front: direct
