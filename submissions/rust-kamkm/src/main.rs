@@ -21,6 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tokio_postgres::{error::SqlState, NoTls, Row};
 
@@ -33,8 +34,61 @@ type HttpBody = Full<Bytes>;
 #[derive(Clone)]
 struct AppState {
     pool: Pool,
+    writes: WriteBatcher,
     jwt_secret: Arc<[u8]>,
     started: Instant,
+}
+
+#[derive(Clone)]
+struct WriteBatcher {
+    tx: mpsc::Sender<WriteJob>,
+}
+
+enum WriteKind {
+    Create {
+        user_id: i64,
+        username: String,
+        body: String,
+    },
+    Like {
+        user_id: i64,
+        post_id: i64,
+    },
+}
+
+struct WriteJob {
+    kind: WriteKind,
+    reply: oneshot::Sender<WriteOutcome>,
+}
+
+enum WriteOutcome {
+    Created(PostBody),
+    Liked { inserted: bool, post_id: i64 },
+    NotFound,
+    Failed,
+}
+
+enum WriteFailure {
+    NotFound,
+    Other,
+}
+
+const WRITE_BATCH_LIMIT: usize = 64;
+
+impl WriteBatcher {
+    fn new(pool: Pool) -> Self {
+        let (tx, rx) = mpsc::channel(WRITE_BATCH_LIMIT * 4);
+        tokio::spawn(run_write_batches(pool, rx));
+        Self { tx }
+    }
+
+    async fn submit(&self, kind: WriteKind) -> WriteOutcome {
+        let (reply, result) = oneshot::channel();
+        if self.tx.send(WriteJob { kind, reply }).await.is_err() {
+            return WriteOutcome::Failed;
+        }
+        result.await.unwrap_or(WriteOutcome::Failed)
+    }
 }
 
 #[derive(Serialize)]
@@ -273,88 +327,187 @@ impl AppState {
             Ok(body) => body,
             Err(message) => return error_response(StatusCode::BAD_REQUEST, message, gzip),
         };
-        let client = match pool_client(&self.pool).await {
-            Ok(client) => client,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let row = match client
-            .query_one(
-                "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
-                &[&user.id, &body],
-            )
+        match self
+            .writes
+            .submit(WriteKind::Create {
+                user_id: user.id,
+                username: user.username,
+                body,
+            })
             .await
         {
-            Ok(row) => row,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
+            WriteOutcome::Created(post) => {
+                json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
             }
-        };
-        let id: i64 = row.get(0);
-        let created_at: DateTime<Utc> = row.get(1);
-        let post = PostBody {
-            id,
-            body,
-            created_at: format_timestamp(created_at),
-            author: user.username,
-            like_count: 0,
-        };
-        json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
+            _ => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+                gzip,
+            ),
+        }
     }
 
     async fn like_post(&self, user_id: i64, post_id: i64, gzip: bool) -> Response<HttpBody> {
-        let client = match pool_client(&self.pool).await {
-            Ok(client) => client,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
+        match self
+            .writes
+            .submit(WriteKind::Like { user_id, post_id })
+            .await
+        {
+            WriteOutcome::Liked { inserted, post_id } => {
+                let status = if inserted {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                };
+                json_response(
+                    status,
+                    &LikeResponse {
+                        liked: true,
+                        already_liked: !inserted,
+                        post_id,
+                    },
                     gzip,
                 )
             }
-        };
-        let inserted = match client
-            .execute(
-                "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
-                &[&user_id, &post_id],
-            )
-            .await
-        {
-            Ok(count) => count,
-            Err(err) => {
-                if err
-                    .as_db_error()
-                    .is_some_and(|db_err| db_err.code() == &SqlState::FOREIGN_KEY_VIOLATION)
-                {
-                    return error_response(StatusCode::NOT_FOUND, "post not found", gzip);
-                }
-                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal server error", gzip);
+            WriteOutcome::NotFound => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
+            _ => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+                gzip,
+            ),
+        }
+    }
+}
+
+async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = Vec::with_capacity(WRITE_BATCH_LIMIT);
+        batch.push(first);
+        while batch.len() < WRITE_BATCH_LIMIT {
+            match timeout(Duration::from_millis(1), rx.recv()).await {
+                Ok(Some(job)) => batch.push(job),
+                _ => break,
             }
-        };
-        let already_liked = inserted == 0;
-        let status = if already_liked {
-            StatusCode::OK
-        } else {
-            StatusCode::CREATED
-        };
-        json_response(
-            status,
-            &LikeResponse {
-                liked: true,
-                already_liked,
-                post_id,
-            },
-            gzip,
-        )
+        }
+        process_write_batch(&pool, batch).await;
+    }
+}
+
+async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
+    let mut client = match pool_client(pool).await {
+        Ok(client) => client,
+        Err(_) => {
+            for job in batch {
+                process_one_write(pool, job).await;
+            }
+            return;
+        }
+    };
+    let tx = match client.transaction().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            for job in batch {
+                process_one_write(pool, job).await;
+            }
+            return;
+        }
+    };
+    let mut results = Vec::with_capacity(batch.len());
+    let mut failed = false;
+    for job in &batch {
+        match execute_write(&tx, &job.kind).await {
+            Ok(result) => results.push(result),
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    if !failed {
+        if tx.commit().await.is_ok() {
+            for (job, result) in batch.into_iter().zip(results) {
+                let _ = job.reply.send(result);
+            }
+            return;
+        }
+        for job in batch {
+            let _ = job.reply.send(WriteOutcome::Failed);
+        }
+        return;
+    }
+    let _ = tx.rollback().await;
+    for job in batch {
+        process_one_write(pool, job).await;
+    }
+}
+
+async fn process_one_write(pool: &Pool, job: WriteJob) {
+    let outcome = async {
+        let mut client = pool_client(pool).await.map_err(|_| WriteFailure::Other)?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|_| WriteFailure::Other)?;
+        let result = execute_write(&tx, &job.kind).await;
+        match result {
+            Ok(outcome) => {
+                tx.commit().await.map_err(|_| WriteFailure::Other)?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
+        }
+    }
+    .await;
+    let _ = job.reply.send(match outcome {
+        Ok(value) => value,
+        Err(WriteFailure::NotFound) => WriteOutcome::NotFound,
+        Err(WriteFailure::Other) => WriteOutcome::Failed,
+    });
+}
+
+async fn execute_write(
+    tx: &tokio_postgres::Transaction<'_>,
+    kind: &WriteKind,
+) -> Result<WriteOutcome, WriteFailure> {
+    match kind {
+        WriteKind::Create {
+            user_id,
+            username,
+            body,
+        } => {
+            let row = tx
+                .query_one(
+                    "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at",
+                    &[user_id, body],
+                )
+                .await
+                .map_err(|_| WriteFailure::Other)?;
+            let created_at: DateTime<Utc> = row.get(1);
+            Ok(WriteOutcome::Created(PostBody {
+                id: row.get(0),
+                body: body.clone(),
+                created_at: format_timestamp(created_at),
+                author: username.clone(),
+                like_count: 0,
+            }))
+        }
+        WriteKind::Like { user_id, post_id } => {
+            let inserted = tx.execute(
+                "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING",
+                &[user_id, post_id],
+            ).await.map_err(|err| {
+                if err.as_db_error().is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION) {
+                    WriteFailure::NotFound
+                } else { WriteFailure::Other }
+            })?;
+            Ok(WriteOutcome::Liked {
+                inserted: inserted != 0,
+                post_id: *post_id,
+            })
+        }
     }
 }
 
@@ -664,8 +817,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .runtime(Runtime::Tokio1)
         .build()?;
 
+    let writes = WriteBatcher::new(pool.clone());
     let state = Arc::new(AppState {
         pool,
+        writes,
         jwt_secret: Arc::from(jwt_secret.into_bytes()),
         started: Instant::now(),
     });
