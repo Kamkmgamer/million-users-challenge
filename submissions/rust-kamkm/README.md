@@ -20,6 +20,9 @@ The Postgres pool defaults to `min(8, available_parallelism())`; each connection
 pool slot is bounded at five seconds and becomes the API's 500 response, except a failed `/health` query, which
 returns the specified 503 degraded response.
 
+Authenticated creates and likes enter bounded 64-item batches and share one transaction commit; failed groups roll
+back and retry individually so per-request errors remain correct.
+
 ## Build and run
 
 ```sh
