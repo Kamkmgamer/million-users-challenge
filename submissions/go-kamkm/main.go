@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -36,13 +35,7 @@ func main() {
 	// Keep the database backend count close to the useful CPU parallelism.
 	// The previous 8x default created excessive contention on the shared
 	// PostgreSQL box; DB_POOL remains available for machine-specific tuning.
-	poolSize := runtime.GOMAXPROCS(0)
-	if poolSize > 16 {
-		poolSize = 16
-	}
-	if poolSize < 1 {
-		poolSize = 1
-	}
+	poolSize := 32
 	if value := os.Getenv("DB_POOL"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 || parsed > 512 {
@@ -60,7 +53,7 @@ func main() {
 	poolConfig.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
 	// Warm only a small set of connections so the first requests do not pay all
 	// setup latency while avoiding a large startup spike on the database host.
-	poolConfig.MinConns = int32(minInt(poolSize, 16))
+	poolConfig.MinConns = int32(minInt(poolSize, 32))
 	poolConfig.MaxConnIdleTime = 10 * time.Minute
 	poolConfig.MaxConnLifetime = 30 * time.Minute
 
