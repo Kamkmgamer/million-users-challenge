@@ -1,4 +1,5 @@
 const std = @import("std");
+const gzip = std.compress.gzip;
 const c = @cImport({
     @cInclude("arpa/inet.h");
     @cInclude("errno.h");
@@ -6,6 +7,7 @@ const c = @cImport({
     @cInclude("libpq-fe.h");
     @cInclude("netdb.h");
     @cInclude("netinet/in.h");
+    @cInclude("netinet/tcp.h");
     @cInclude("openssl/evp.h");
     @cInclude("openssl/hmac.h");
     @cInclude("sys/epoll.h");
@@ -18,6 +20,7 @@ const c = @cImport({
 const Allocator = std.mem.Allocator;
 const MAX_REQUEST = 16 * 1024;
 const IO_BATCH = 256;
+const WRITE_BATCH = 64;
 const DB_FEED_SQL = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
 const DB_POST_SQL = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1";
 const DB_INSERT_SQL = "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
@@ -34,18 +37,57 @@ const Connection = struct {
     output: ?[]u8,
     output_pos: usize,
     close_after: bool,
+    want_gzip: bool,
+    worker: ?*Worker,
+    request_next: ?*Connection,
+    completion_next: ?*Connection,
 };
 
-const Job = struct {
-    next: ?*Job,
-    conn: *Connection,
-};
+const Worker = struct {
+    app: *App,
+    index: usize,
+    request_mutex: std.Thread.Mutex = .{},
+    request_cond: std.Thread.Condition = .{},
+    request_head: ?*Connection = null,
+    request_tail: ?*Connection = null,
+    completion_mutex: std.Thread.Mutex = .{},
+    completion_head: ?*Connection = null,
+    completion_tail: ?*Connection = null,
+    db: ?*c.PGconn = null,
+    prepared: bool = false,
 
-const Completion = struct {
-    next: ?*Completion,
-    conn: *Connection,
-    response: ?[]u8,
-    close_after: bool,
+    fn dequeue(self: *Worker) *Connection {
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+        while (self.request_head == null) self.request_cond.wait(&self.request_mutex);
+        const conn = self.request_head.?;
+        self.request_head = conn.request_next;
+        if (self.request_head == null) self.request_tail = null;
+        conn.request_next = null;
+        return conn;
+    }
+
+    fn tryDequeue(self: *Worker) ?*Connection {
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+        const conn = self.request_head orelse return null;
+        self.request_head = conn.request_next;
+        if (self.request_head == null) self.request_tail = null;
+        conn.request_next = null;
+        return conn;
+    }
+
+    fn complete(self: *Worker, conn: *Connection, response: ?[]u8, close_after: bool) void {
+        conn.output = response;
+        conn.output_pos = 0;
+        conn.close_after = close_after;
+        conn.completion_next = null;
+        self.completion_mutex.lock();
+        if (self.completion_tail) |tail| tail.completion_next = conn else self.completion_head = conn;
+        self.completion_tail = conn;
+        self.completion_mutex.unlock();
+        self.app.notify();
+    }
 };
 
 const App = struct {
@@ -54,83 +96,68 @@ const App = struct {
     notify_fd: c_int,
     db_url: []u8,
     jwt_secret: []u8,
-    request_mutex: std.Thread.Mutex = .{},
-    request_cond: std.Thread.Condition = .{},
-    request_head: ?*Job = null,
-    request_tail: ?*Job = null,
-    completion_mutex: std.Thread.Mutex = .{},
-    completion_head: ?*Completion = null,
-    completion_tail: ?*Completion = null,
-    worker_count: usize,
-    workers: []std.Thread,
+    workers: []Worker,
+    threads: []std.Thread,
+    write_worker_count: usize,
+    next_read_worker: usize = 0,
+    next_write_worker: usize = 0,
     started_ns: i128,
 
     fn enqueue(self: *App, conn: *Connection) void {
-        const job = self.allocator.create(Job) catch {
-            self.closeConnection(conn);
-            return;
+        // Keep writes on a dedicated subset of workers. A burst of likes or
+        // posts then cannot occupy every connection serving feed/post reads.
+        const read_worker_count = self.workers.len - self.write_worker_count;
+        const request = parseHttp(conn.read_buf.?[0..conn.read_len]);
+        const route = if (request) |req| routeFor(req.method, req.path) else .unknown;
+        conn.want_gzip = if (request) |req| req.accept_gzip else false;
+        const is_write = route == .create or route == .like;
+        const worker: *Worker = if (is_write and self.write_worker_count > 0) blk: {
+            const index = read_worker_count + self.next_write_worker;
+            self.next_write_worker = (self.next_write_worker + 1) % self.write_worker_count;
+            break :blk &self.workers[index];
+        } else blk: {
+            const index = self.next_read_worker;
+            self.next_read_worker = (self.next_read_worker + 1) % read_worker_count;
+            break :blk &self.workers[index];
         };
-        job.* = .{ .next = null, .conn = conn };
-        self.request_mutex.lock();
-        if (self.request_tail) |tail| tail.next = job else self.request_head = job;
-        self.request_tail = job;
-        self.request_cond.signal();
-        self.request_mutex.unlock();
-    }
-
-    fn dequeue(self: *App) ?*Job {
-        self.request_mutex.lock();
-        defer self.request_mutex.unlock();
-        while (self.request_head == null) self.request_cond.wait(&self.request_mutex);
-        const job = self.request_head.?;
-        self.request_head = job.next;
-        if (self.request_head == null) self.request_tail = null;
-        return job;
-    }
-
-    fn complete(self: *App, conn: *Connection, response: ?[]u8, close_after: bool) void {
-        const done = self.allocator.create(Completion) catch {
-            if (response) |buf| self.allocator.free(buf);
-            self.completion_mutex.lock();
-            self.completion_mutex.unlock();
-            return;
-        };
-        done.* = .{ .next = null, .conn = conn, .response = response, .close_after = close_after };
-        self.completion_mutex.lock();
-        if (self.completion_tail) |tail| tail.next = done else self.completion_head = done;
-        self.completion_tail = done;
-        self.completion_mutex.unlock();
-        var one: u64 = 1;
-        _ = c.write(self.notify_fd, @ptrCast(&one), @sizeOf(u64));
+        conn.worker = worker;
+        conn.request_next = null;
+        worker.request_mutex.lock();
+        if (worker.request_tail) |tail| tail.request_next = conn else worker.request_head = conn;
+        worker.request_tail = conn;
+        worker.request_cond.signal();
+        worker.request_mutex.unlock();
     }
 
     fn drainCompletions(self: *App) void {
         var junk: u64 = 0;
         while (c.read(self.notify_fd, @ptrCast(&junk), @sizeOf(u64)) > 0) {}
-        while (true) {
-            self.completion_mutex.lock();
-            const done = self.completion_head;
-            if (done) |item| {
-                self.completion_head = item.next;
-                if (self.completion_head == null) self.completion_tail = null;
-            }
-            self.completion_mutex.unlock();
-            const item = done orelse break;
-            defer self.allocator.destroy(item);
-            const conn = item.conn;
-            if (conn.state == .closed) {
-                if (item.response) |buf| self.allocator.free(buf);
-                self.freeConnection(conn);
-                continue;
-            }
-            if (item.response) |buf| {
-                conn.output = buf;
-                conn.output_pos = 0;
-                conn.close_after = item.close_after;
-                conn.state = .writing;
-                self.modifyConnection(conn, c.EPOLLOUT | c.EPOLLERR | c.EPOLLHUP);
-            } else {
-                self.closeConnection(conn);
+        for (self.workers) |*worker| {
+            while (true) {
+                worker.completion_mutex.lock();
+                const conn = worker.completion_head;
+                if (conn) |item| {
+                    worker.completion_head = item.completion_next;
+                    if (worker.completion_head == null) worker.completion_tail = null;
+                }
+                worker.completion_mutex.unlock();
+                const item = conn orelse break;
+                item.completion_next = null;
+                if (item.state == .closed) {
+                    self.freeConnection(item);
+                    continue;
+                }
+                if (item.output != null) {
+                    item.output_pos = 0;
+                    item.state = .writing;
+                    self.modifyConnection(item, c.EPOLLOUT | c.EPOLLERR | c.EPOLLHUP);
+                } else {
+                    // The worker has finished without a response. Mark it as
+                    // event-loop-owned before closing so the connection record
+                    // is reclaimed instead of being left in .closed state.
+                    item.state = .open;
+                    self.closeConnection(item);
+                }
             }
         }
     }
@@ -166,6 +193,11 @@ const App = struct {
         if (conn.output) |buf| self.allocator.free(buf);
         self.allocator.destroy(conn);
     }
+
+    fn notify(self: *App) void {
+        var one: u64 = 1;
+        _ = c.write(self.notify_fd, @ptrCast(&one), @sizeOf(u64));
+    }
 };
 
 const HttpRequest = struct {
@@ -173,6 +205,7 @@ const HttpRequest = struct {
     path: []const u8,
     authorization: ?[]const u8,
     body: []const u8,
+    accept_gzip: bool,
 };
 
 const Route = enum { health, feed, post, create, like, unknown };
@@ -521,6 +554,7 @@ fn parseHttp(raw: []const u8) ?HttpRequest {
     const header_end_rel = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return null;
     const header_end = header_end_rel + 4;
     var auth: ?[]const u8 = null;
+    var accept_gzip = false;
     var cursor = line_end + 2;
     while (cursor < header_end_rel + 2) {
         const end = std.mem.indexOf(u8, raw[cursor .. header_end_rel + 2], "\r\n") orelse return null;
@@ -531,6 +565,15 @@ fn parseHttp(raw: []const u8) ?HttpRequest {
             var value = header[colon + 1 ..];
             while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) value = value[1..];
             if (std.ascii.eqlIgnoreCase(name, "authorization")) auth = value;
+            if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
+                var enc = value;
+                while (enc.len > 0) {
+                    const comma = std.mem.indexOfScalar(u8, enc, ',') orelse enc.len;
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, enc[0..comma], " \t"), "gzip")) accept_gzip = true;
+                    if (comma == enc.len) break;
+                    enc = enc[comma + 1 ..];
+                }
+            }
         }
         cursor = absolute + 2;
     }
@@ -550,7 +593,7 @@ fn parseHttp(raw: []const u8) ?HttpRequest {
         cursor = absolute + 2;
     }
     if (header_end + content_length > raw.len) return null;
-    return .{ .method = method, .path = path, .authorization = auth, .body = raw[header_end .. header_end + content_length] };
+    return .{ .method = method, .path = path, .authorization = auth, .body = raw[header_end .. header_end + content_length], .accept_gzip = accept_gzip };
 }
 
 fn headerComplete(raw: []const u8) ?usize {
@@ -617,13 +660,7 @@ fn base64UrlDecode(input: []const u8, out: []u8) !usize {
     var acc: u32 = 0;
     var bits: u8 = 0;
     var n: usize = 0;
-    var padding = false;
     for (input) |ch| {
-        if (ch == '=') {
-            padding = true;
-            continue;
-        }
-        if (padding) return error.InvalidBase64;
         const v: u8 = switch (ch) {
             'A'...'Z' => ch - 'A',
             'a'...'z' => ch - 'a' + 26,
@@ -642,6 +679,7 @@ fn base64UrlDecode(input: []const u8, out: []u8) !usize {
         }
     }
     if (bits >= 6) return error.InvalidBase64;
+    if (bits > 0 and (acc & ((@as(u32, 1) << @as(u5, @intCast(bits))) - 1)) != 0) return error.InvalidBase64;
     return n;
 }
 
@@ -776,21 +814,32 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) !void {
     }
 }
 
-fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool) ![]u8 {
+fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool, want_gzip: bool) ![]u8 {
+    var compressed: ?[]u8 = null;
+    defer if (compressed) |buf| allocator.free(buf);
+    var response_body = body;
+    if (want_gzip and body.len >= 64) {
+        var encoded = std.ArrayList(u8).init(allocator);
+        defer encoded.deinit();
+        var input = std.io.fixedBufferStream(body);
+        gzip.compress(input.reader(), encoded.writer(), .{ .level = .fast }) catch return error.Compression;
+        compressed = try encoded.toOwnedSlice();
+        response_body = compressed.?;
+    }
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
-    try out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ status, reason, body.len, if (close_after) "close" else "keep-alive" });
-    try out.appendSlice(body);
+    try out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ status, reason, if (compressed != null) "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" else "", response_body.len, if (close_after) "close" else "keep-alive" });
+    try out.appendSlice(response_body);
     return out.toOwnedSlice();
 }
 
-fn errorResponse(allocator: Allocator, status: u16, message: []const u8) ![]u8 {
+fn errorResponse(allocator: Allocator, status: u16, message: []const u8, want_gzip: bool) ![]u8 {
     var body = std.ArrayList(u8).init(allocator);
     defer body.deinit();
     try body.appendSlice("{\"error\":\"");
     try jsonEscape(&body, message);
     try body.appendSlice("\"}");
-    return responseFor(allocator, status, statusReason(status), body.items, false);
+    return responseFor(allocator, status, statusReason(status), body.items, false, want_gzip);
 }
 
 fn statusReason(status: u16) []const u8 {
@@ -852,7 +901,7 @@ fn appendPost(out: *std.ArrayList(u8), res: *c.PGresult, row: c_int) !void {
     try out.append('}');
 }
 
-fn paramsExec(db: *c.PGconn, sql: []const u8, values: []const []const u8, lengths: []const c_int) ?*c.PGresult {
+fn preparedExec(db: *c.PGconn, name: []const u8, values: []const []const u8, lengths: []const c_int) ?*c.PGresult {
     // libpq treats text parameters as NUL-terminated strings; paramLengths is
     // only meaningful for binary parameters. Copy each value into a bounded
     // scratch buffer and terminate it explicitly so IDs and post bodies never
@@ -868,34 +917,53 @@ fn paramsExec(db: *c.PGconn, sql: []const u8, values: []const []const u8, length
         ptrs[i] = @ptrCast(&scratch[i]);
         lens[i] = lengths[i];
     }
-    return c.PQexecParams(db, @ptrCast(sql.ptr), @intCast(values.len), null, @ptrCast(&ptrs), @ptrCast(&lens), null, 0);
+    return c.PQexecPrepared(db, @ptrCast(name.ptr), @intCast(values.len), @ptrCast(&ptrs), @ptrCast(&lens), null, 0);
 }
 
-fn dbConnection(app: *App, db: *?*c.PGconn) ?*c.PGconn {
-    if (db.*) |conn| {
+fn dbConnection(worker: *Worker) ?*c.PGconn {
+    if (worker.db) |conn| {
         if (c.PQstatus(conn) == c.CONNECTION_OK) return conn;
         c.PQfinish(conn);
-        db.* = null;
+        worker.db = null;
+        worker.prepared = false;
     }
-    const conn = c.PQconnectdb(app.db_url.ptr);
+    const conn = c.PQconnectdb(worker.app.db_url.ptr);
     if (conn == null or c.PQstatus(conn) != c.CONNECTION_OK) {
         if (conn) |bad| c.PQfinish(bad);
-        db.* = null;
+        worker.db = null;
         return null;
     }
-    const set_result = c.PQexec(conn, "SET TIME ZONE 'UTC'");
+    const set_result = c.PQexec(conn, "SET TIME ZONE 'UTC'; SET jit = off");
     if (set_result == null or c.PQresultStatus(set_result) != c.PGRES_COMMAND_OK) {
         if (set_result) |r| c.PQclear(r);
         c.PQfinish(conn);
-        db.* = null;
+        worker.db = null;
         return null;
     }
     c.PQclear(set_result);
-    db.* = conn;
+    const statements = [_]struct { name: []const u8, sql: []const u8, params: c_int }{
+        .{ .name = "feed", .sql = DB_FEED_SQL, .params = 0 },
+        .{ .name = "post", .sql = DB_POST_SQL, .params = 1 },
+        .{ .name = "insert_post", .sql = DB_INSERT_SQL, .params = 2 },
+        .{ .name = "like_post", .sql = DB_LIKE_SQL, .params = 2 },
+    };
+    for (statements) |statement| {
+        const result = c.PQprepare(conn, @ptrCast(statement.name.ptr), @ptrCast(statement.sql.ptr), statement.params, null);
+        if (result == null or c.PQresultStatus(result) != c.PGRES_COMMAND_OK) {
+            if (result) |r| c.PQclear(r);
+            c.PQfinish(conn);
+            worker.db = null;
+            worker.prepared = false;
+            return null;
+        }
+        c.PQclear(result);
+    }
+    worker.prepared = true;
+    worker.db = conn;
     return conn;
 }
 
-fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
+fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
     const raw = conn.read_buf.?[0..conn.read_len];
     const req = parseHttp(raw) orelse return error.MalformedRequest;
     const route = routeFor(req.method, req.path);
@@ -910,13 +978,13 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
         };
     }
     if (route == .health) {
-        const connection = dbConnection(app, db) orelse {
+        const connection = dbConnection(worker) orelse {
             var msg = std.ArrayList(u8).init(app.allocator);
             defer msg.deinit();
             try msg.appendSlice("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"");
-            if (db.*) |bad| try jsonEscape(&msg, std.mem.span(c.PQerrorMessage(bad))) else try msg.appendSlice("database unavailable");
+            if (worker.db) |bad| try jsonEscape(&msg, std.mem.span(c.PQerrorMessage(bad))) else try msg.appendSlice("database unavailable");
             try msg.appendSlice("\"}");
-            return responseFor(app.allocator, 503, "Service Unavailable", msg.items, false);
+            return responseFor(app.allocator, 503, "Service Unavailable", msg.items, false, req.accept_gzip);
         };
         const res = c.PQexec(connection, "SELECT 1");
         if (res == null or c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
@@ -928,24 +996,24 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
                 c.PQclear(r);
             } else try msg.appendSlice("database unavailable");
             try msg.appendSlice("\"}");
-            return responseFor(app.allocator, 503, "Service Unavailable", msg.items, false);
+            return responseFor(app.allocator, 503, "Service Unavailable", msg.items, false, req.accept_gzip);
         }
         c.PQclear(res);
         const uptime: u64 = @intCast(@divTrunc(std.time.nanoTimestamp() - app.started_ns, std.time.ns_per_s));
         var body = std.ArrayList(u8).init(app.allocator);
         defer body.deinit();
         try body.writer().print("{{\"status\":\"ok\",\"db\":\"ok\",\"uptime_s\":{d}}}", .{uptime});
-        return responseFor(app.allocator, 200, "OK", body.items, false);
+        return responseFor(app.allocator, 200, "OK", body.items, false, req.accept_gzip);
     }
     switch (route) {
         .feed => {
-            const connection = dbConnection(app, db) orelse return error.Internal;
-            const res = c.PQexec(connection, DB_FEED_SQL);
-            if (res == null or c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
-                if (res) |r| c.PQclear(r);
+            const connection = dbConnection(worker) orelse return error.Internal;
+            const res = preparedExec(connection, "feed", &[_][]const u8{}, &[_]c_int{}) orelse return error.Internal;
+            if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+                c.PQclear(res);
                 return error.Internal;
             }
-            const result = res.?;
+            const result = res;
             defer c.PQclear(result);
             var body = std.ArrayList(u8).init(app.allocator);
             defer body.deinit();
@@ -957,7 +1025,7 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
                 try appendPost(&body, result, i);
             }
             try body.appendSlice("]}");
-            return responseFor(app.allocator, 200, "OK", body.items, false);
+            return responseFor(app.allocator, 200, "OK", body.items, false, req.accept_gzip);
         },
         .post => {
             const id = postIdFromPath(req.path, false) orelse return error.InvalidId;
@@ -965,8 +1033,8 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             const id_text = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch return error.Internal;
             const values = [_][]const u8{id_text};
             const lengths = [_]c_int{@intCast(id_text.len)};
-            const connection = dbConnection(app, db) orelse return error.Internal;
-            const res = paramsExec(connection, DB_POST_SQL, &values, &lengths) orelse return error.Internal;
+            const connection = dbConnection(worker) orelse return error.Internal;
+            const res = preparedExec(connection, "post", &values, &lengths) orelse return error.Internal;
             const result = res;
             defer c.PQclear(result);
             if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.Internal;
@@ -976,7 +1044,7 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             try body.appendSlice("{\"post\":");
             try appendPost(&body, result, 0);
             try body.append('}');
-            return responseFor(app.allocator, 200, "OK", body.items, false);
+            return responseFor(app.allocator, 200, "OK", body.items, false, req.accept_gzip);
         },
         .create => {
             var parsed_body = app.allocator.alloc(u8, req.body.len + 1) catch return error.Internal;
@@ -991,8 +1059,8 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             const user_text = std.fmt.bufPrint(&user_buf, "{d}", .{auth.?.user_id}) catch return error.Internal;
             const values = [_][]const u8{ user_text, body_slice };
             const lengths = [_]c_int{ @intCast(user_text.len), @intCast(body_slice.len) };
-            const connection = dbConnection(app, db) orelse return error.Internal;
-            const res = paramsExec(connection, DB_INSERT_SQL, &values, &lengths) orelse return error.Internal;
+            const connection = dbConnection(worker) orelse return error.Internal;
+            const res = preparedExec(connection, "insert_post", &values, &lengths) orelse return error.Internal;
             defer c.PQclear(res);
             if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) return error.Internal;
             const new_id = pgSlice(res, 0, 0);
@@ -1008,7 +1076,7 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             try body.appendSlice("\",\"author\":\"");
             try jsonEscape(&body, auth.?.username);
             try body.appendSlice("\",\"like_count\":0}}");
-            return responseFor(app.allocator, 201, "Created", body.items, false);
+            return responseFor(app.allocator, 201, "Created", body.items, false, req.accept_gzip);
         },
         .like => {
             const id = postIdFromPath(req.path, true) orelse return error.InvalidId;
@@ -1018,8 +1086,8 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             const post_text = std.fmt.bufPrint(&post_buf, "{d}", .{id}) catch return error.Internal;
             const values = [_][]const u8{ user_text, post_text };
             const lengths = [_]c_int{ @intCast(user_text.len), @intCast(post_text.len) };
-            const connection = dbConnection(app, db) orelse return error.Internal;
-            const res = paramsExec(connection, DB_LIKE_SQL, &values, &lengths) orelse return error.Internal;
+            const connection = dbConnection(worker) orelse return error.Internal;
+            const res = preparedExec(connection, "like_post", &values, &lengths) orelse return error.Internal;
             defer c.PQclear(res);
             if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
                 const state_ptr = c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE);
@@ -1031,36 +1099,100 @@ fn processRequest(app: *App, db: *?*c.PGconn, conn: *Connection) ![]u8 {
             var body = std.ArrayList(u8).init(app.allocator);
             defer body.deinit();
             try body.writer().print("{{\"liked\":true,\"already_liked\":{s},\"post_id\":{d}}}", .{ if (inserted) "false" else "true", id });
-            return responseFor(app.allocator, if (inserted) 201 else 200, if (inserted) "Created" else "OK", body.items, false);
+            return responseFor(app.allocator, if (inserted) 201 else 200, if (inserted) "Created" else "OK", body.items, false, req.accept_gzip);
         },
         else => return error.Internal,
     }
 }
 
-fn makeErrorFor(app: *App, err: anyerror) ![]u8 {
+fn makeErrorFor(app: *App, err: anyerror, want_gzip: bool) ![]u8 {
     return switch (err) {
-        error.NotFound => errorResponse(app.allocator, 404, "not found"),
-        error.InvalidId => errorResponse(app.allocator, 400, "invalid post id"),
-        error.PostNotFound => errorResponse(app.allocator, 404, "post not found"),
-        error.MissingBearer => errorResponse(app.allocator, 401, "missing bearer token"),
-        error.InvalidToken, error.InvalidPayload => errorResponse(app.allocator, 401, if (err == error.InvalidPayload) "invalid token payload" else "invalid or expired token"),
-        error.MalformedJson => errorResponse(app.allocator, 400, "malformed JSON body"),
-        error.BodyRequired => errorResponse(app.allocator, 400, "body is required"),
-        error.BodyTooLong => errorResponse(app.allocator, 400, "body must be at most 500 characters"),
-        error.MalformedRequest => errorResponse(app.allocator, 400, "malformed JSON body"),
-        else => errorResponse(app.allocator, 500, "internal server error"),
+        error.NotFound => errorResponse(app.allocator, 404, "not found", want_gzip),
+        error.InvalidId => errorResponse(app.allocator, 400, "invalid post id", want_gzip),
+        error.PostNotFound => errorResponse(app.allocator, 404, "post not found", want_gzip),
+        error.MissingBearer => errorResponse(app.allocator, 401, "missing bearer token", want_gzip),
+        error.InvalidToken, error.InvalidPayload => errorResponse(app.allocator, 401, if (err == error.InvalidPayload) "invalid token payload" else "invalid or expired token", want_gzip),
+        error.MalformedJson => errorResponse(app.allocator, 400, "malformed JSON body", want_gzip),
+        error.BodyRequired => errorResponse(app.allocator, 400, "body is required", want_gzip),
+        error.BodyTooLong => errorResponse(app.allocator, 400, "body must be at most 500 characters", want_gzip),
+        error.MalformedRequest => errorResponse(app.allocator, 400, "malformed JSON body", want_gzip),
+        else => errorResponse(app.allocator, 500, "internal server error", want_gzip),
     };
 }
 
-fn workerMain(app: *App) void {
-    var db: ?*c.PGconn = null;
+fn requestRoute(conn: *Connection) Route {
+    const raw = conn.read_buf orelse return .unknown;
+    const req = parseHttp(raw[0..conn.read_len]) orelse return .unknown;
+    return routeFor(req.method, req.path);
+}
+
+fn completeSingle(worker: *Worker, conn: *Connection) void {
+    if (conn.state == .closed) {
+        worker.complete(conn, null, false);
+        return;
+    }
+    const response = processRequest(worker.app, worker, conn) catch |err| makeErrorFor(worker.app, err, conn.want_gzip) catch null;
+    worker.complete(conn, response, false);
+}
+
+fn runTransactionCommand(db: *c.PGconn, command: []const u8) bool {
+    const result = c.PQexec(db, @ptrCast(command.ptr));
+    if (result == null) return false;
+    const ok = c.PQresultStatus(result) == c.PGRES_COMMAND_OK;
+    c.PQclear(result);
+    return ok;
+}
+
+fn processWriteBatch(worker: *Worker, first: *Connection) void {
+    var batch: [WRITE_BATCH]*Connection = undefined;
+    var responses: [WRITE_BATCH]?[]u8 = undefined;
+    for (&responses) |*response| response.* = null;
+    batch[0] = first;
+    var count: usize = 1;
+    while (count < WRITE_BATCH) {
+        const next = worker.tryDequeue() orelse break;
+        batch[count] = next;
+        count += 1;
+    }
+
+    const db = dbConnection(worker) orelse {
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
+        return;
+    };
+    if (!runTransactionCommand(db, "BEGIN")) {
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
+        return;
+    }
+
+    var failed = false;
+    for (batch[0..count], 0..) |conn, index| {
+        responses[index] = processRequest(worker.app, worker, conn) catch {
+            failed = true;
+            break;
+        };
+    }
+
+    if (!failed and runTransactionCommand(db, "COMMIT")) {
+        for (batch[0..count], 0..) |conn, index| worker.complete(conn, responses[index], false);
+        return;
+    }
+
+    for (responses[0..count]) |response| if (response) |buf| worker.app.allocator.free(buf);
+    _ = runTransactionCommand(db, "ROLLBACK");
+    for (batch[0..count]) |conn| completeSingle(worker, conn);
+}
+
+fn workerMain(worker: *Worker) void {
     while (true) {
-        const job = app.dequeue() orelse continue;
-        const conn = job.conn;
-        const response = processRequest(app, &db, conn) catch |err| makeErrorFor(app, err) catch null;
-        const close_after = false;
-        app.allocator.destroy(job);
-        app.complete(conn, response, close_after);
+        const conn = worker.dequeue();
+        const write_start = worker.app.workers.len - worker.app.write_worker_count;
+        const is_write_worker = worker.app.write_worker_count > 0 and worker.index >= write_start;
+        const route = requestRoute(conn);
+        if (is_write_worker and (route == .create or route == .like)) {
+            processWriteBatch(worker, conn);
+        } else {
+            completeSingle(worker, conn);
+        }
     }
 }
 
@@ -1091,7 +1223,10 @@ fn makeListener(host: []const u8, port: u16, allocator: Allocator) !c_int {
         var yes: c_int = 1;
         _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&yes), @sizeOf(c_int));
         _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEPORT, @ptrCast(&yes), @sizeOf(c_int));
-        if (c.bind(fd, entry.ai_addr, entry.ai_addrlen) == 0 and c.listen(fd, 65535) == 0) return fd;
+        // Keep the accept queue useful during the million-connection ramp.
+        // The kernel may clamp this to net.core.somaxconn.
+        const backlog: c_int = 262144;
+        if (c.bind(fd, entry.ai_addr, entry.ai_addrlen) == 0 and c.listen(fd, backlog) == 0) return fd;
         _ = c.close(fd);
     }
     return error.Bind;
@@ -1107,12 +1242,15 @@ fn acceptConnections(app: *App, listener: c_int) void {
         if (fd >= 0) {
             _ = c.fcntl(fd, c.F_SETFL, c.fcntl(fd, c.F_GETFL, @as(c_int, 0)) | c.O_NONBLOCK);
             _ = c.fcntl(fd, c.F_SETFD, c.fcntl(fd, c.F_GETFD, @as(c_int, 0)) | c.FD_CLOEXEC);
+            var yes: c_int = 1;
+            _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, @ptrCast(&yes), @sizeOf(c_int));
+            _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, @ptrCast(&yes), @sizeOf(c_int));
         }
         const conn = app.allocator.create(Connection) catch {
             _ = c.close(fd);
             continue;
         };
-        conn.* = .{ .app = app, .fd = fd, .state = .open, .read_buf = null, .read_len = 0, .output = null, .output_pos = 0, .close_after = false };
+        conn.* = .{ .app = app, .fd = fd, .state = .open, .read_buf = null, .read_len = 0, .output = null, .output_pos = 0, .close_after = false, .want_gzip = false, .worker = null, .request_next = null, .completion_next = null };
         if (!app.addConnection(conn)) {
             _ = c.close(fd);
             app.allocator.destroy(conn);
@@ -1244,8 +1382,11 @@ pub fn main() !void {
     const port = std.fmt.parseInt(u16, envOr("PORT", "3000"), 10) catch return error.Configuration;
     const extra_raw = std.posix.getenv("EXTRA_PORT");
     const extra_port: ?u16 = if (extra_raw) |value| if (value.len > 0) std.fmt.parseInt(u16, value, 10) catch return error.Configuration else null else null;
-    var workers = 8 * (std.Thread.getCpuCount() catch 1);
-    if (workers > 128) workers = 128;
+    // Match the application pool to the challenge box. The remote staging
+    // host has eight CPUs and naturally settles at eight; the official
+    // sixteen-CPU box gets sixteen independent DB sessions. DB_POOL remains
+    // available for deployments with a different database limit.
+    var workers: usize = @min(@as(usize, 16), std.Thread.getCpuCount() catch @as(usize, 1));
     if (std.posix.getenv("DB_POOL")) |value| workers = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
     if (workers == 0 or workers > 512) return error.Configuration;
 
@@ -1253,11 +1394,19 @@ pub fn main() !void {
     if (epfd < 0) return error.Epoll;
     const notify = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
     if (notify < 0) return error.Event;
-    var app = App{ .allocator = allocator, .epfd = epfd, .notify_fd = notify, .db_url = db_url, .jwt_secret = secret, .worker_count = workers, .workers = &[_]std.Thread{}, .started_ns = std.time.nanoTimestamp() };
-    var worker_list = std.ArrayList(std.Thread).init(allocator);
-    defer worker_list.deinit();
-    for (0..workers) |_| worker_list.append(try std.Thread.spawn(.{}, workerMain, .{&app})) catch return error.Thread;
-    app.workers = worker_list.items;
+    // Most challenge traffic is read-heavy. Keep one lane for writes by
+    // default so reads can use nearly the whole pool; deployments with a
+    // write-heavy mix can override this explicitly.
+    var write_worker_count: usize = if (workers > 1) @max(@as(usize, 1), workers / 8) else 0;
+    if (std.posix.getenv("WRITE_WORKERS")) |value| {
+        write_worker_count = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
+    }
+    if (write_worker_count >= workers) return error.Configuration;
+    var app = App{ .allocator = allocator, .epfd = epfd, .notify_fd = notify, .db_url = db_url, .jwt_secret = secret, .workers = &[_]Worker{}, .threads = &[_]std.Thread{}, .write_worker_count = write_worker_count, .started_ns = std.time.nanoTimestamp() };
+    app.workers = try allocator.alloc(Worker, workers);
+    app.threads = try allocator.alloc(std.Thread, workers);
+    for (app.workers, 0..) |*worker, index| worker.* = .{ .app = &app, .index = index };
+    for (app.workers, 0..) |*worker, index| app.threads[index] = std.Thread.spawn(.{}, workerMain, .{worker}) catch return error.Thread;
     var listeners: [2]c_int = undefined;
     var listener_count: usize = 1;
     listeners[0] = try makeListener(host, port, allocator);
