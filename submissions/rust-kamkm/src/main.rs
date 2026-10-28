@@ -847,7 +847,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or(1);
     // Keep PostgreSQL backend count near useful CPU parallelism. A large
     // pool only adds contention on the shared database; DB_POOL overrides it.
-    let default_pool = cores.min(16).max(1);
+    let default_pool = 16;
     let pool_size = match env::var("DB_POOL") {
         Ok(value) => value
             .parse::<usize>()

@@ -15,7 +15,7 @@ The service binds `HOST:PORT` and `HOST:EXTRA_PORT` (when `EXTRA_PORT` is set) i
 descriptor limit to the hard limit so idle keep-alive connections are not capped by an interactive shell's default
 limit.
 
-The Postgres pool defaults to `min(8, available_parallelism())`; each connection uses `jit=off` and
+The Postgres pool defaults to 16 connections; each connection uses `jit=off` and
 `plan_cache_mode=force_generic_plan`; set `DB_POOL` (1 through 512) to override it. Waiting for a
 pool slot is bounded at five seconds and becomes the API's 500 response, except a failed `/health` query, which
 returns the specified 503 degraded response.
