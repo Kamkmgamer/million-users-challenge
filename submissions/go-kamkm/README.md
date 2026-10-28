@@ -6,7 +6,7 @@ A compact Go 1.27.1 `net/http` server backed by `github.com/jackc/pgx/v5` 5.11.0
 
 `install.sh` installs Go 1.27.1 on a clean Ubuntu host. `build.sh` produces `bin/feed-go-kamkm` with cgo disabled and stripped symbols. `start.sh` runs that binary in the foreground and sets a 75% physical-memory `GOMEMLIMIT` when the operator has not supplied one.
 
-The process consumes `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, `EXTRA_PORT`, and optional `DB_POOL`. The pool defaults to `min(8, GOMAXPROCS)` to avoid oversubscribing PostgreSQL, and an explicit `DB_POOL` may be 1..512. Each connection starts with `jit=off` and `plan_cache_mode=force_generic_plan`.
+The process consumes `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, `EXTRA_PORT`, and optional `DB_POOL`. The pool defaults to `min(16, GOMAXPROCS)` to keep enough queries in flight without oversubscribing PostgreSQL, and an explicit `DB_POOL` may be 1..512. Each connection starts with `jit=off` and `plan_cache_mode=force_generic_plan`.
 
 ## Implementation notes
 

@@ -37,8 +37,8 @@ func main() {
 	// The previous 8x default created excessive contention on the shared
 	// PostgreSQL box; DB_POOL remains available for machine-specific tuning.
 	poolSize := runtime.GOMAXPROCS(0)
-	if poolSize > 8 {
-		poolSize = 8
+	if poolSize > 16 {
+		poolSize = 16
 	}
 	if poolSize < 1 {
 		poolSize = 1
