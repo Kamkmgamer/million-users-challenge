@@ -1,4 +1,0 @@
-feed-zig
-*.o
-zig-cache/
-.zig-cache/
