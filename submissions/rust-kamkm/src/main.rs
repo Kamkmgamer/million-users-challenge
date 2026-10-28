@@ -636,6 +636,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .transpose()?;
 
     let pg_config: tokio_postgres::Config = database_url.parse()?;
+    let mut pg_config = pg_config;
+    pg_config.options("-c jit=off -c plan_cache_mode=force_generic_plan");
     let manager = Manager::from_config(
         pg_config,
         NoTls,
@@ -646,7 +648,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let default_pool = cores.saturating_mul(8).min(128).max(1);
+    // Keep PostgreSQL backend count near useful CPU parallelism. A large
+    // pool only adds contention on the shared database; DB_POOL overrides it.
+    let default_pool = cores.min(8).max(1);
     let pool_size = match env::var("DB_POOL") {
         Ok(value) => value
             .parse::<usize>()
