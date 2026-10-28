@@ -33,12 +33,15 @@ func main() {
 		log.Fatal("JWT_SECRET is required")
 	}
 
-	poolSize := 8 * runtime.GOMAXPROCS(0)
-	if poolSize < 16 {
-		poolSize = 16
+	// Keep the database backend count close to the useful CPU parallelism.
+	// The previous 8x default created excessive contention on the shared
+	// PostgreSQL box; DB_POOL remains available for machine-specific tuning.
+	poolSize := runtime.GOMAXPROCS(0)
+	if poolSize > 8 {
+		poolSize = 8
 	}
-	if poolSize > maxDBConns {
-		poolSize = maxDBConns
+	if poolSize < 1 {
+		poolSize = 1
 	}
 	if value := os.Getenv("DB_POOL"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -53,6 +56,8 @@ func main() {
 		log.Fatalf("invalid DATABASE_URL: %v", err)
 	}
 	poolConfig.MaxConns = int32(poolSize)
+	poolConfig.ConnConfig.RuntimeParams["jit"] = "off"
+	poolConfig.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
 	// Warm only a small set of connections so the first requests do not pay all
 	// setup latency while avoiding a large startup spike on the database host.
 	poolConfig.MinConns = int32(minInt(poolSize, 16))
