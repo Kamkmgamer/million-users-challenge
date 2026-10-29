@@ -26,4 +26,8 @@ python3 submissions/zig-kamkm/tests/concurrent_writes.py http://127.0.0.1:3000 -
 
 The Python probes use the usual `psql` connection environment. Add `--docker CONTAINER` when PostgreSQL runs in Docker.
 
+## Measurements
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the remote before/after tests, the matched C comparison, and the sustained connection test. [benchmark-results.json](benchmark-results.json) records the measured metrics and executable hashes.
+
 Front: direct
