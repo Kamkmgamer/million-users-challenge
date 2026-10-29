@@ -21,13 +21,14 @@ use serde::Serialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{timeout, Duration};
 use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
 
 const FEED_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20";
 const POST_BY_ID_SQL: &str = "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id)::int AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1";
-const INSERT_POST_SQL: &str = "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
+const INSERT_POST_SQL: &str =
+    "INSERT INTO posts (user_id, body) VALUES ($1, $2) RETURNING id, created_at";
 const INSERT_LIKE_SQL: &str = "INSERT INTO likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT (user_id, post_id) DO NOTHING";
 const MAX_REQUEST_BODY: usize = 16 * 1024;
 
@@ -39,6 +40,7 @@ struct AppState {
     writes: WriteBatcher,
     jwt_secret: Arc<[u8]>,
     started: Instant,
+    feed_cache: Arc<RwLock<Option<(Instant, Bytes)>>>,
 }
 
 #[derive(Clone)]
@@ -254,6 +256,14 @@ impl AppState {
     }
 
     async fn feed(&self, gzip: bool) -> Response<HttpBody> {
+        {
+            let cache = self.feed_cache.read().await;
+            if let Some((at, body)) = cache.as_ref() {
+                if at.elapsed() < Duration::from_secs(1) {
+                    return json_bytes_response(StatusCode::OK, body.clone(), gzip);
+                }
+            }
+        }
         let client = match pool_client(&self.pool).await {
             Ok(client) => client,
             Err(_) => {
@@ -297,7 +307,26 @@ impl AppState {
                 }
             }
         }
-        json_response(StatusCode::OK, &FeedBody { posts }, gzip)
+        let plain = match serde_json::to_vec(&FeedBody { posts }) {
+            Ok(body) => Bytes::from(body),
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
+                    gzip,
+                )
+            }
+        };
+        {
+            let mut cache = self.feed_cache.write().await;
+            if cache
+                .as_ref()
+                .map_or(true, |(at, _)| at.elapsed() >= Duration::from_secs(1))
+            {
+                *cache = Some((Instant::now(), plain.clone()));
+            }
+        }
+        json_bytes_response(StatusCode::OK, plain, gzip)
     }
 
     async fn get_post(&self, id: i64, gzip: bool) -> Response<HttpBody> {
@@ -359,6 +388,7 @@ impl AppState {
             .await
         {
             WriteOutcome::Created(post) => {
+                self.feed_cache.write().await.take();
                 json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
             }
             _ => error_response(
@@ -542,11 +572,19 @@ async fn execute_write(
             }))
         }
         WriteKind::Like { user_id, post_id } => {
-            let inserted = tx.execute(like_statement, &[user_id, post_id]).await.map_err(|err| {
-                if err.as_db_error().is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION) {
-                    WriteFailure::NotFound
-                } else { WriteFailure::Other }
-            })?;
+            let inserted = tx
+                .execute(like_statement, &[user_id, post_id])
+                .await
+                .map_err(|err| {
+                    if err
+                        .as_db_error()
+                        .is_some_and(|db| db.code() == &SqlState::FOREIGN_KEY_VIOLATION)
+                    {
+                        WriteFailure::NotFound
+                    } else {
+                        WriteFailure::Other
+                    }
+                })?;
             Ok(WriteOutcome::Liked {
                 inserted: inserted != 0,
                 post_id: *post_id,
@@ -706,18 +744,22 @@ fn json_response<T: Serialize>(
         Ok(bytes) => bytes,
         Err(_) => br#"{"error":"internal server error"}"#.to_vec(),
     };
+    json_bytes_response(status, Bytes::from(plain), force_gzip)
+}
+
+fn json_bytes_response(status: StatusCode, plain: Bytes, force_gzip: bool) -> Response<HttpBody> {
     let (body, compressed) = if force_gzip {
         let mut encoder = GzEncoder::new(Vec::with_capacity(plain.len()), Compression::fast());
         if std::io::Write::write_all(&mut encoder, &plain).is_ok() {
             match encoder.finish() {
                 Ok(bytes) => (bytes, true),
-                Err(_) => (plain, false),
+                Err(_) => (plain.to_vec(), false),
             }
         } else {
-            (plain, false)
+            (plain.to_vec(), false)
         }
     } else {
-        (plain, false)
+        (plain.to_vec(), false)
     };
     let body_len = body.len();
     let mut response = Response::new(Full::new(Bytes::from(body)));
@@ -867,6 +909,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         writes,
         jwt_secret: Arc::from(jwt_secret.into_bytes()),
         started: Instant::now(),
+        feed_cache: Arc::new(RwLock::new(None)),
     });
     let listener = bind_listener(&host, port)?;
     let extra_listener = extra_port

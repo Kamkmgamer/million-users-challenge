@@ -9,6 +9,7 @@ Rust feed API implementation for `SPEC.md`.
 - `deadpool-postgres`/`tokio-postgres` with the required SQL
 - `serde_json` compact JSON and `jsonwebtoken` HS256 validation
 - gzip responses when the request advertises `Accept-Encoding: gzip`
+- one-second per-process caching for the hot feed response, invalidated when a post is created
 
 The service binds `HOST:PORT` and `HOST:EXTRA_PORT` (when `EXTRA_PORT` is set) in one process. Listeners use a
 65,535 connection backlog and accepted sockets have `TCP_NODELAY` enabled. `start.sh` raises the soft file
