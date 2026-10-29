@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -18,6 +17,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"compress/gzip"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -36,6 +36,7 @@ const postQuery = `SELECT p.id, p.body, p.created_at, u.username,
 
 type application struct {
 	db      *pgxpool.Pool
+	reads   *readBatcher
 	writes  *writeBatcher
 	secret  []byte
 	started time.Time
@@ -152,27 +153,13 @@ func (a *application) health(w http.ResponseWriter, r *http.Request) {
 func (a *application) feed(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := queryContext(r.Context())
 	defer cancel()
-	rows, err := a.db.Query(ctx, postQuery+" ORDER BY p.created_at DESC, p.id DESC LIMIT $1", feedLimit)
+	result := a.reads.submit(ctx, 0)
+	err := result.err
 	if err != nil {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
-	defer rows.Close()
-
-	posts := make([]postJSON, 0, feedLimit)
-	for rows.Next() {
-		post, scanErr := scanPost(rows)
-		if scanErr != nil {
-			writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-			return
-		}
-		posts = append(posts, post)
-	}
-	if err := rows.Err(); err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
-		return
-	}
-	body, err := json.Marshal(feedEnvelope{Posts: posts})
+	body, err := json.Marshal(feedEnvelope{Posts: result.posts})
 	if err != nil {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
@@ -188,7 +175,8 @@ func (a *application) getPost(w http.ResponseWriter, r *http.Request, rawID stri
 	}
 	ctx, cancel := queryContext(r.Context())
 	defer cancel()
-	post, err := scanPost(a.db.QueryRow(ctx, postQuery+" WHERE p.id = $1", id))
+	result := a.reads.submit(ctx, id)
+	err := result.err
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeJSON(w, r, http.StatusNotFound, errorEnvelope{Error: "post not found"})
 		return
@@ -197,7 +185,7 @@ func (a *application) getPost(w http.ResponseWriter, r *http.Request, rawID stri
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
-	writeJSON(w, r, http.StatusOK, postEnvelope{Post: post})
+	writeJSON(w, r, http.StatusOK, postEnvelope{Post: result.posts[0]})
 }
 
 func (a *application) create(w http.ResponseWriter, r *http.Request) {
@@ -422,7 +410,7 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, value any) {
 }
 
 func writeBody(w http.ResponseWriter, r *http.Request, status int, body []byte) {
-	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
+	if len(body) >= 1024 && acceptsGzip(r.Header.Get("Accept-Encoding")) {
 		buffer := gzipBuffers.Get().(*bytes.Buffer)
 		buffer.Reset()
 		writer := gzipWriters.Get().(*gzip.Writer)

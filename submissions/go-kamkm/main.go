@@ -2,10 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -14,12 +12,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 const (
 	defaultHost = "0.0.0.0"
 	defaultPort = "80"
-	maxDBConns  = 256
 )
 
 func main() {
@@ -32,10 +31,9 @@ func main() {
 		log.Fatal("JWT_SECRET is required")
 	}
 
-	// Keep the database backend count close to the useful CPU parallelism.
-	// The previous 8x default created excessive contention on the shared
-	// PostgreSQL box; DB_POOL remains available for machine-specific tuning.
-	poolSize := 32
+	// Read batch concurrency bounds active sessions. DB_POOL is the shared
+	// ceiling for reads, the reserved writer, and profile lookups.
+	poolSize := 128
 	if value := os.Getenv("DB_POOL"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 || parsed > 512 {
@@ -65,7 +63,7 @@ func main() {
 	}
 	defer db.Close()
 
-	application := &application{db: db, writes: newWriteBatcher(db), secret: []byte(jwtSecret), started: time.Now()}
+	application := &application{db: db, reads: newReadBatcher(db), writes: newWriteBatcher(db), secret: []byte(jwtSecret), started: time.Now()}
 	host := valueOr("HOST", defaultHost)
 	port := valueOr("PORT", defaultPort)
 	ports := []string{port}
@@ -73,7 +71,7 @@ func main() {
 		ports = append(ports, extra)
 	}
 
-	servers := make([]*http.Server, len(ports))
+	servers := make([]*fasthttp.Server, len(ports))
 	listeners := make([]net.Listener, len(ports))
 	for i, p := range ports {
 		address := net.JoinHostPort(host, p)
@@ -82,12 +80,20 @@ func main() {
 			log.Fatalf("listen %s: %v", address, listenErr)
 		}
 		listeners[i] = listener
-		servers[i] = &http.Server{
-			Handler:           application,
-			IdleTimeout:       180 * time.Second,
-			ReadHeaderTimeout: 15 * time.Second,
-			MaxHeaderBytes:    16 << 10,
-			ErrorLog:          log.New(os.Stderr, "http: ", log.LstdFlags),
+		servers[i] = &fasthttp.Server{
+			Handler:            fasthttpadaptor.NewFastHTTPHandler(application),
+			Concurrency:        2000000,
+			ReduceMemoryUsage:  true,
+			IdleTimeout:        180 * time.Second,
+			ReadTimeout:        15 * time.Second,
+			ReadBufferSize:     16 << 10,
+			MaxRequestBodySize: maxBodyBytes,
+			CloseOnShutdown:    true,
+			ErrorHandler: func(ctx *fasthttp.RequestCtx, err error) {
+				ctx.SetContentType("application/json")
+				ctx.SetStatusCode(400)
+				ctx.SetBodyString(`{"error":"malformed JSON body"}`)
+			},
 		}
 	}
 
@@ -98,7 +104,7 @@ func main() {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			if serveErr := servers[index].Serve(listeners[index]); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			if serveErr := servers[index].Serve(listeners[index]); serveErr != nil {
 				serveErrors <- serveErr
 			}
 		}(i)
@@ -114,9 +120,10 @@ func main() {
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, server := range servers {
-		_ = server.Shutdown(shutdownContext)
+		_ = server.ShutdownWithContext(shutdownContext)
 	}
 	wait.Wait()
+	application.writes.close()
 }
 
 func valueOr(name, fallback string) string {

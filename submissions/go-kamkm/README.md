@@ -1,20 +1,30 @@
-# Go Kamkm feed server
+# Go feed server
 
-A compact Go 1.27.1 `net/http` server backed by `github.com/jackc/pgx/v5` 5.11.0's native `pgxpool`. It serves both configured ports from one process, keeps HTTP/1.1 connections alive for 180 seconds, and disables TCP keep-alive probes so idle application connections do not generate a packet every few seconds.
+A Go 1.27.1 submission using fasthttp 1.77.0 and pgx 5.11.0. Both ports share one process. The HTTP transport releases idle request, response, and reader buffers. It keeps connections alive for 180 seconds and disables TCP keep-alive probes.
+
+Eight read workers send batches of up to 64 independent SELECT statements through pgx. Each request executes the SQL from `SPEC.md`; response data and JWT verification results are never cached across requests. The bounded read queue holds at most 1,024 jobs.
+
+Authenticated writes enter a bounded queue and share transaction commits in groups of up to 64. The writer reserves a database connection to avoid waiting behind read traffic, pipelines the statements, and releases responses after commit. Failed statements roll back before individual retries. An uncertain COMMIT result returns an error without replaying the writes. With `DB_POOL=1`, the writer releases the connection between batches so reads can proceed. Shutdown stops the writer and releases its connection before closing the pool.
+
+The application validates HS256 signatures, expiration, and token payloads on every authenticated request. Ordered response structs preserve the API's JSON format. Gzip writers and output buffers are pooled during active responses; bodies smaller than 1,024 bytes are sent directly.
 
 ## Build and run
 
-`install.sh` installs Go 1.27.1 on a clean Ubuntu host. `build.sh` produces `bin/feed-go-kamkm` with cgo disabled and stripped symbols. `start.sh` runs that binary in the foreground and sets a 75% physical-memory `GOMEMLIMIT` when the operator has not supplied one.
+`install.sh` installs Go 1.27.1 on Ubuntu. `build.sh` pins that toolchain, downloads the checked-in module versions, and emits `bin/feed-go-kamkm` with cgo disabled. `start.sh` runs it in the foreground and supplies a 75% physical-memory `GOMEMLIMIT` when none is set.
 
-The process consumes `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, `EXTRA_PORT`, and optional `DB_POOL`. The pool defaults to 32 connections to keep enough I/O in flight without oversubscribing PostgreSQL, and an explicit `DB_POOL` may be 1..512. Each connection starts with `jit=off` and `plan_cache_mode=force_generic_plan`.
+Set `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT`. `DB_POOL` defaults to 128 and accepts 1 through 512. Connections use `jit=off` and `plan_cache_mode=force_generic_plan`. Database operations have a five-second timeout.
 
-## Implementation notes
+## Validation
 
-- Routing is a single allocation-light dispatcher for the five paths. Authentication is checked before the like endpoint parses its post ID.
-- JWTs are verified on every authenticated request with a constant-time HMAC-SHA256 comparison, an exact `HS256` algorithm check, and a required unexpired `exp` claim. The `sub` claim must be a positive decimal string.
-- Database statements are the queries from `SPEC.md`, issued through one shared pool. Query contexts have a five-second bound, and missing-post likes are translated from the post foreign-key error.
-- Authenticated writes enter a bounded 64-item batcher and share one transaction/commit; a failed batch is rolled back and retried individually so per-request errors remain correct.
-- Responses use ordered Go structs and UTC millisecond formatting. Gzip response buffers and writers are pooled only for the duration of a response, so idle keep-alive connections do not retain compression state.
-- Every request queries PostgreSQL; response data is never cached across requests.
+Run the repository API suite against a fresh seed clone, then the regressions:
 
-The feed freshness regression probe can check an external database commit with `python3 tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test`, using the usual PostgreSQL environment variables.
+```sh
+bash test/test.sh http://127.0.0.1:3000
+python3 submissions/go-kamkm/tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test
+python3 submissions/go-kamkm/tests/concurrent_writes.py http://127.0.0.1:3000 --database feed_test
+python3 submissions/go-kamkm/tests/http_transport.py http://127.0.0.1:3000 --idle 16
+```
+
+The database probes use the usual `psql` connection environment, or `--docker CONTAINER`.
+
+Front: direct
