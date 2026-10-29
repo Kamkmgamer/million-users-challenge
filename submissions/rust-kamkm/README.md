@@ -9,7 +9,7 @@ Rust feed API implementation for `SPEC.md`.
 - `deadpool-postgres`/`tokio-postgres` with the required SQL
 - `serde_json` compact JSON and `jsonwebtoken` HS256 validation
 - gzip responses when the request advertises `Accept-Encoding: gzip`
-- one-second per-process caching for the hot feed response, invalidated when a post is created
+- a fresh PostgreSQL query for every request, with no response-data caching
 
 The service binds `HOST:PORT` and `HOST:EXTRA_PORT` (when `EXTRA_PORT` is set) in one process. Listeners use a
 65,535 connection backlog and accepted sockets have `TCP_NODELAY` enabled. `start.sh` raises the soft file
@@ -44,3 +44,5 @@ bash test/run.sh submissions/rust-luna
 
 
 Front: direct
+
+The feed freshness regression probe can check an external database commit with `python3 tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test`, using the usual PostgreSQL environment variables.

@@ -21,7 +21,7 @@ use serde::Serialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
 
@@ -40,7 +40,6 @@ struct AppState {
     writes: WriteBatcher,
     jwt_secret: Arc<[u8]>,
     started: Instant,
-    feed_cache: Arc<RwLock<Option<(Instant, Bytes)>>>,
 }
 
 #[derive(Clone)]
@@ -256,14 +255,6 @@ impl AppState {
     }
 
     async fn feed(&self, gzip: bool) -> Response<HttpBody> {
-        {
-            let cache = self.feed_cache.read().await;
-            if let Some((at, body)) = cache.as_ref() {
-                if at.elapsed() < Duration::from_secs(1) {
-                    return json_bytes_response(StatusCode::OK, body.clone(), gzip);
-                }
-            }
-        }
         let client = match pool_client(&self.pool).await {
             Ok(client) => client,
             Err(_) => {
@@ -317,15 +308,6 @@ impl AppState {
                 )
             }
         };
-        {
-            let mut cache = self.feed_cache.write().await;
-            if cache
-                .as_ref()
-                .map_or(true, |(at, _)| at.elapsed() >= Duration::from_secs(1))
-            {
-                *cache = Some((Instant::now(), plain.clone()));
-            }
-        }
         json_bytes_response(StatusCode::OK, plain, gzip)
     }
 
@@ -388,7 +370,6 @@ impl AppState {
             .await
         {
             WriteOutcome::Created(post) => {
-                self.feed_cache.write().await.take();
                 json_response(StatusCode::CREATED, &PostResponse { post }, gzip)
             }
             _ => error_response(
@@ -909,7 +890,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         writes,
         jwt_secret: Arc::from(jwt_secret.into_bytes()),
         started: Instant::now(),
-        feed_cache: Arc::new(RwLock::new(None)),
     });
     let listener = bind_listener(&host, port)?;
     let extra_listener = extra_port
