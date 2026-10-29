@@ -101,6 +101,9 @@ const App = struct {
     write_worker_count: usize,
     next_read_worker: usize = 0,
     next_write_worker: usize = 0,
+    feed_cache_mutex: std.Thread.Mutex = .{},
+    feed_cache: ?[]u8 = null,
+    feed_cache_ns: i128 = 0,
     started_ns: i128,
 
     fn enqueue(self: *App, conn: *Connection) void {
@@ -197,6 +200,14 @@ const App = struct {
     fn notify(self: *App) void {
         var one: u64 = 1;
         _ = c.write(self.notify_fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    fn invalidateFeedCache(self: *App) void {
+        self.feed_cache_mutex.lock();
+        defer self.feed_cache_mutex.unlock();
+        if (self.feed_cache) |body| self.allocator.free(body);
+        self.feed_cache = null;
+        self.feed_cache_ns = 0;
     }
 };
 
@@ -1007,6 +1018,19 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
     }
     switch (route) {
         .feed => {
+            // The feed is read-heavy and changes only when a post or like is
+            // written. Reuse the serialized JSON between requests in the
+            // same process; writes invalidate it before their response is
+            // released. This removes a database round trip from bursts of
+            // identical feed requests without changing the API response.
+            app.feed_cache_mutex.lock();
+            const cache_fresh = app.feed_cache != null and std.time.nanoTimestamp() - app.feed_cache_ns < 1 * std.time.ns_per_s;
+            const cached = if (cache_fresh) app.allocator.dupe(u8, app.feed_cache.?) catch null else null;
+            app.feed_cache_mutex.unlock();
+            if (cached) |body| {
+                defer app.allocator.free(body);
+                return responseFor(app.allocator, 200, "OK", body, false, req.accept_gzip);
+            }
             const connection = dbConnection(worker) orelse return error.Internal;
             const res = preparedExec(connection, "feed", &[_][]const u8{}, &[_]c_int{}) orelse return error.Internal;
             if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
@@ -1025,6 +1049,16 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
                 try appendPost(&body, result, i);
             }
             try body.appendSlice("]}");
+            const cache_body = app.allocator.dupe(u8, body.items) catch null;
+            if (cache_body) |owned| {
+                app.feed_cache_mutex.lock();
+                if (app.feed_cache == null or std.time.nanoTimestamp() - app.feed_cache_ns >= 1 * std.time.ns_per_s) {
+                    if (app.feed_cache) |old| app.allocator.free(old);
+                    app.feed_cache = owned;
+                    app.feed_cache_ns = std.time.nanoTimestamp();
+                } else app.allocator.free(owned);
+                app.feed_cache_mutex.unlock();
+            }
             return responseFor(app.allocator, 200, "OK", body.items, false, req.accept_gzip);
         },
         .post => {
@@ -1096,6 +1130,7 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
                 return error.Internal;
             }
             const inserted = std.mem.eql(u8, std.mem.span(c.PQcmdTuples(res)), "1");
+            app.invalidateFeedCache();
             var body = std.ArrayList(u8).init(app.allocator);
             defer body.deinit();
             try body.writer().print("{{\"liked\":true,\"already_liked\":{s},\"post_id\":{d}}}", .{ if (inserted) "false" else "true", id });
