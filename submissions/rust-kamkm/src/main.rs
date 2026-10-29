@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+mod transport;
 use std::env;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -7,20 +7,16 @@ use std::time::Instant;
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use deadpool_postgres::{GenericClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
-use flate2::write::GzEncoder;
-use flate2::Compression;
+use flate2::{Compress, Compression, FlushCompress, Status};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Serialize;
 use serde_json::Value;
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::{TcpListener, TcpStream};
+use std::cell::RefCell;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use tokio_postgres::{error::SqlState, NoTls, Row, Statement};
@@ -38,8 +34,92 @@ type HttpBody = Full<Bytes>;
 struct AppState {
     pool: Pool,
     writes: WriteBatcher,
+    reads: ReadBatcher,
     jwt_secret: Arc<[u8]>,
     started: Instant,
+}
+
+#[derive(Clone)]
+struct ReadBatcher {
+    tx: mpsc::Sender<ReadJob>,
+}
+struct ReadJob {
+    id: Option<i64>,
+    reply: oneshot::Sender<Result<Vec<PostBody>, ()>>,
+}
+impl ReadBatcher {
+    fn new(pool: Pool) -> Self {
+        let (tx, mut rx) = mpsc::channel::<ReadJob>(1024);
+        tokio::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(8));
+            loop {
+                let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+                    break;
+                };
+                let Some(first) = rx.recv().await else { break };
+                let mut jobs = Vec::with_capacity(64);
+                jobs.push(first);
+                while jobs.len() < 64 {
+                    match rx.try_recv() {
+                        Ok(job) => jobs.push(job),
+                        Err(_) => break,
+                    }
+                }
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    process_read_batch(&pool, jobs).await;
+                    drop(permit);
+                });
+            }
+        });
+        Self { tx }
+    }
+    async fn submit(&self, id: Option<i64>) -> Result<Vec<PostBody>, ()> {
+        timeout(Duration::from_secs(5), async {
+            let (reply, result) = oneshot::channel();
+            self.tx.send(ReadJob { id, reply }).await.map_err(|_| ())?;
+            result.await.map_err(|_| ())?
+        })
+        .await
+        .map_err(|_| ())?
+    }
+}
+async fn process_read_batch(pool: &Pool, jobs: Vec<ReadJob>) {
+    let queries = async {
+        let client = pool_client(pool).await.map_err(|_| ())?;
+        let feed = client.prepare_cached(FEED_SQL).await.map_err(|_| ())?;
+        let post = client
+            .prepare_cached(POST_BY_ID_SQL)
+            .await
+            .map_err(|_| ())?;
+        let results = futures_util::future::join_all(jobs.iter().map(|job| {
+            let (client, feed, post) = (&client, &feed, &post);
+            async move {
+                let rows = match job.id {
+                    Some(id) => client.query(post, &[&id]).await,
+                    None => client.query(feed, &[]).await,
+                }
+                .map_err(|_| ())?;
+                rows.iter()
+                    .map(|row| post_from_row(row).ok_or(()))
+                    .collect()
+            }
+        }))
+        .await;
+        Ok::<_, ()>(results)
+    };
+    match timeout(Duration::from_secs(5), queries).await {
+        Ok(Ok(results)) => {
+            for (job, result) in jobs.into_iter().zip(results) {
+                let _ = job.reply.send(result);
+            }
+        }
+        _ => {
+            for job in jobs {
+                let _ = job.reply.send(Err(()));
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -153,7 +233,7 @@ enum AuthError {
 }
 
 impl AppState {
-    async fn handle(&self, req: Request<Incoming>) -> Response<HttpBody> {
+    async fn handle(&self, req: Request<Full<Bytes>>) -> Response<HttpBody> {
         let method = req.method().clone();
         let path = req.uri().path();
         let wants_gzip = accepts_gzip(req.headers());
@@ -255,104 +335,27 @@ impl AppState {
     }
 
     async fn feed(&self, gzip: bool) -> Response<HttpBody> {
-        let client = match pool_client(&self.pool).await {
-            Ok(client) => client,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let statement = match client.prepare_cached(FEED_SQL).await {
-            Ok(statement) => statement,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let rows = match client.query(&statement, &[]).await {
-            Ok(rows) => rows,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let mut posts = Vec::with_capacity(20);
-        for row in rows {
-            match post_from_row(&row) {
-                Some(post) => posts.push(post),
-                None => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal server error",
-                        gzip,
-                    )
-                }
-            }
-        }
-        let plain = match serde_json::to_vec(&FeedBody { posts }) {
-            Ok(body) => Bytes::from(body),
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        json_bytes_response(StatusCode::OK, plain, gzip)
-    }
-
-    async fn get_post(&self, id: i64, gzip: bool) -> Response<HttpBody> {
-        let client = match pool_client(&self.pool).await {
-            Ok(client) => client,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let statement = match client.prepare_cached(POST_BY_ID_SQL).await {
-            Ok(statement) => statement,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let row = match client.query_opt(&statement, &[&id]).await {
-            Ok(row) => row,
-            Err(_) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
-                    gzip,
-                )
-            }
-        };
-        let Some(row) = row else {
-            return error_response(StatusCode::NOT_FOUND, "post not found", gzip);
-        };
-        let Some(post) = post_from_row(&row) else {
-            return error_response(
+        match self.reads.submit(None).await {
+            Ok(posts) => json_response(StatusCode::OK, &FeedBody { posts }, gzip),
+            Err(()) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal server error",
                 gzip,
-            );
-        };
-        json_response(StatusCode::OK, &PostResponse { post }, gzip)
+            ),
+        }
+    }
+    async fn get_post(&self, id: i64, gzip: bool) -> Response<HttpBody> {
+        match self.reads.submit(Some(id)).await {
+            Ok(mut posts) => match posts.pop() {
+                Some(post) => json_response(StatusCode::OK, &PostResponse { post }, gzip),
+                None => error_response(StatusCode::NOT_FOUND, "post not found", gzip),
+            },
+            Err(()) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+                gzip,
+            ),
+        }
     }
 
     async fn create_post(&self, user: AuthUser, body: &[u8], gzip: bool) -> Response<HttpBody> {
@@ -416,8 +419,9 @@ async fn run_write_batches(pool: Pool, mut rx: mpsc::Receiver<WriteJob>) {
     while let Some(first) = rx.recv().await {
         let mut batch = Vec::with_capacity(WRITE_BATCH_LIMIT);
         batch.push(first);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
         while batch.len() < WRITE_BATCH_LIMIT {
-            match timeout(Duration::from_millis(1), rx.recv()).await {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(job)) => batch.push(job),
                 _ => break,
             }
@@ -463,21 +467,20 @@ async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
             return;
         }
     };
-    let mut results = Vec::with_capacity(batch.len());
-    let mut failed = false;
-    for job in &batch {
-        match execute_write(&tx, &job.kind, &insert_statement, &like_statement).await {
-            Ok(result) => results.push(result),
-            Err(_) => {
-                failed = true;
-                break;
-            }
-        }
-    }
-    if !failed {
+    // Poll all queries together so tokio-postgres can pipeline them. Responses
+    // stay private until the transaction has committed successfully.
+    let outcomes = futures_util::future::join_all(
+        batch
+            .iter()
+            .map(|job| execute_write(&tx, &job.kind, &insert_statement, &like_statement)),
+    )
+    .await;
+    if outcomes.iter().all(Result::is_ok) {
         if tx.commit().await.is_ok() {
-            for (job, result) in batch.into_iter().zip(results) {
-                let _ = job.reply.send(result);
+            for (job, result) in batch.into_iter().zip(outcomes) {
+                if let Ok(result) = result {
+                    let _ = job.reply.send(result);
+                }
             }
             return;
         }
@@ -487,6 +490,7 @@ async fn process_write_batch(pool: &Pool, batch: Vec<WriteJob>) {
         return;
     }
     let _ = tx.rollback().await;
+    drop(client);
     for job in batch {
         process_one_write(pool, job).await;
     }
@@ -625,7 +629,7 @@ enum BodyError {
     Read,
 }
 
-async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, BodyError> {
+async fn read_body(req: Request<Full<Bytes>>) -> Result<Vec<u8>, BodyError> {
     if req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -728,17 +732,25 @@ fn json_response<T: Serialize>(
     json_bytes_response(status, Bytes::from(plain), force_gzip)
 }
 
+thread_local! {
+    static GZIP: RefCell<Compress> = RefCell::new(Compress::new_gzip(Compression::fast(), 15));
+}
+
 fn json_bytes_response(status: StatusCode, plain: Bytes, force_gzip: bool) -> Response<HttpBody> {
-    let (body, compressed) = if force_gzip {
-        let mut encoder = GzEncoder::new(Vec::with_capacity(plain.len()), Compression::fast());
-        if std::io::Write::write_all(&mut encoder, &plain).is_ok() {
-            match encoder.finish() {
-                Ok(bytes) => (bytes, true),
-                Err(_) => (plain.to_vec(), false),
+    let (body, compressed) = if force_gzip && plain.len() >= 1024 {
+        // Reuse the compressor's history tables on this executor thread.
+        // This synchronous section never holds the borrow across an await.
+        GZIP.with(|state| {
+            let mut compressor = state.borrow_mut();
+            compressor.reset();
+            let mut output = Vec::with_capacity(plain.len() + plain.len() / 1000 + 128);
+            match compressor.compress_vec(&plain, &mut output, FlushCompress::Finish) {
+                Ok(Status::StreamEnd) if compressor.total_in() == plain.len() as u64 => {
+                    (output, true)
+                }
+                _ => (plain.to_vec(), false),
             }
-        } else {
-            (plain.to_vec(), false)
-        }
+        })
     } else {
         (plain.to_vec(), false)
     };
@@ -814,27 +826,9 @@ async fn serve_listener(listener: TcpListener, state: Arc<AppState>) -> std::io:
         let _ = stream.set_nodelay(true);
         let state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(err) = serve_connection(stream, state).await {
-                // Connection errors are normal when clients close idle keep-alive sockets.
-                if !err.is_incomplete_message() {
-                    let _ = err;
-                }
-            }
+            let _ = transport::serve(stream, state).await;
         });
     }
-}
-
-async fn serve_connection(stream: TcpStream, state: Arc<AppState>) -> Result<(), hyper::Error> {
-    let io = TokioIo::new(stream);
-    let service = service_fn(move |req: Request<Incoming>| {
-        let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(state.handle(req).await) }
-    });
-    http1::Builder::new()
-        .keep_alive(true)
-        .max_buf_size(MAX_REQUEST_BODY)
-        .serve_connection(io, service)
-        .await
 }
 
 fn env_required(name: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -868,9 +862,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    // Keep PostgreSQL backend count near useful CPU parallelism. A large
-    // pool only adds contention on the shared database; DB_POOL overrides it.
-    let default_pool = 16;
+    // Batch concurrency bounds active read sessions. DB_POOL is the upper
+    // limit shared with writes and profile lookups.
+    let default_pool = 128;
     let pool_size = match env::var("DB_POOL") {
         Ok(value) => value
             .parse::<usize>()
@@ -885,9 +879,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .build()?;
 
     let writes = WriteBatcher::new(pool.clone());
+    let reads = ReadBatcher::new(pool.clone());
     let state = Arc::new(AppState {
         pool,
         writes,
+        reads,
         jwt_secret: Arc::from(jwt_secret.into_bytes()),
         started: Instant::now(),
     });
