@@ -1446,12 +1446,23 @@ fn dispatchIfComplete(app: *App, conn: *Connection) void {
 
 fn readConnection(app: *App, conn: *Connection) void {
     if (conn.state != .open) return;
-    if (conn.read_buf == null) conn.read_buf = app.allocator.alloc(u8, MAX_REQUEST) catch {
+    if (conn.read_buf == null) conn.read_buf = app.allocator.alloc(u8, 512) catch {
         app.closeConnection(conn);
         return;
     };
-    const buf = conn.read_buf.?;
-    while (conn.read_len < buf.len) {
+    while (true) {
+        if (conn.read_len == conn.read_buf.?.len) {
+            const old = conn.read_buf.?;
+            if (old.len == MAX_REQUEST) {
+                app.closeConnection(conn);
+                return;
+            }
+            conn.read_buf = app.allocator.realloc(old, @min(old.len * 2, MAX_REQUEST)) catch {
+                app.closeConnection(conn);
+                return;
+            };
+        }
+        const buf = conn.read_buf.?;
         const n = c.read(conn.fd, @ptrCast(buf.ptr + conn.read_len), buf.len - conn.read_len);
         if (n > 0) {
             conn.read_len += @intCast(n);
@@ -1467,7 +1478,6 @@ fn readConnection(app: *App, conn: *Connection) void {
         app.closeConnection(conn);
         return;
     }
-    if (conn.read_len == buf.len) app.closeConnection(conn);
 }
 
 fn writeConnection(app: *App, conn: *Connection) void {

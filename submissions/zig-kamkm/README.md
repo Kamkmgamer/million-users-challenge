@@ -1,6 +1,6 @@
 # Zig feed server
 
-A Linux x86-64 submission built with Zig 0.13.0. Two `SO_REUSEPORT` epoll loops share a total budget of 16 database workers. Idle sockets retain a small connection record; active requests allocate their buffers separately.
+A Linux x86-64 submission built with Zig 0.13.0. Two `SO_REUSEPORT` epoll loops share a total budget of 16 database workers. Idle sockets retain a small connection record. Active request buffers start at 512 bytes and double as needed up to the 16-KiB request limit. The server releases each buffer after sending the response.
 
 Each worker owns one libpq connection and prepares the four SQL statements from `SPEC.md`. Read workers send up to 64 queued SELECT statements before a shared pipeline Sync. Each request still executes its own SQL. Two write workers pipeline up to 64 writes in a transaction and hold responses until commit. Failed statements roll back before individual retries. An uncertain COMMIT result returns an error without replaying the writes. JWTs are verified on every authenticated request with OpenSSL HMAC-SHA256. Response data is never cached across requests.
 
@@ -20,6 +20,7 @@ Run the repository API suite against a fresh seed clone, then the regressions:
 
 ```sh
 bash test/test.sh http://127.0.0.1:3000
+python3 submissions/zig-kamkm/tests/request_buffers.py http://127.0.0.1:3000
 python3 submissions/zig-kamkm/tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test
 python3 submissions/zig-kamkm/tests/concurrent_writes.py http://127.0.0.1:3000 --database feed_test
 ```
@@ -28,6 +29,6 @@ The Python probes use the usual `psql` connection environment. Add `--docker CON
 
 ## Measurements
 
-See [BENCHMARKS.md](BENCHMARKS.md) for the remote before/after tests, the matched C comparison, and the sustained connection test. [benchmark-results.json](benchmark-results.json) records the measured metrics and executable hashes.
+See [BENCHMARKS.md](BENCHMARKS.md) for measured throughput, latency, and sustained connection tests. [benchmark-results.json](benchmark-results.json) records the measured metrics and executable hashes.
 
 Front: direct
