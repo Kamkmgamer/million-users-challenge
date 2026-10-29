@@ -1,9 +1,29 @@
-# Zig low-level feed server
+# Zig feed server
 
-This submission is a standalone Zig 0.13.0 server. It uses one level-triggered Linux `epoll` loop for both listeners and keeps idle HTTP/1.1 sockets as small connection records; request and response buffers are allocated only while a request is active. A bounded 16-worker pool (override with `DB_POOL`, maximum 512) gives each worker one libpq connection, so blocking PostgreSQL round trips never block the socket loop. Each worker has its own request and completion queue, and the connection record is the queue node, avoiding a heap allocation for every handoff. The default pool reserves one write lane, leaving the rest for the read-heavy challenge workload; `WRITE_WORKERS` can tune the split. Write lanes group up to 64 queued writes in one transaction and release responses only after commit; a failed group is rolled back and retried one request at a time. Workers prepare the four fixed SQL statements once per connection and execute those prepared statements thereafter. Every request queries PostgreSQL; response data is never cached across requests. Responses are gzip-compressed when the client advertises it, using Zig's fast native compressor. The workers issue the SQL from `SPEC.md` and format JSON in the process. JWT HS256 checks use OpenSSL HMAC, and the JSON/HTTP parsers are allocation-light.
+A Linux x86-64 submission built with Zig 0.13.0. Two `SO_REUSEPORT` epoll loops share a total budget of 16 database workers. Idle sockets retain a small connection record; active requests allocate their buffers separately.
 
-`install.sh` installs the pinned official Zig 0.13.0 archive and, on Ubuntu, the `libpq-dev` and `libssl-dev` headers used by `@cImport`. `build.sh` links `libpq` and `libcrypto` and emits `feed-zig`; `start.sh` runs it in the foreground. Set the `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT` variables from `SPEC.md` before starting.
+Each worker owns one libpq connection and prepares the four SQL statements from `SPEC.md`. Read workers send up to 64 queued SELECT statements before a shared pipeline Sync. Each request still executes its own SQL. Two write workers pipeline up to 64 writes in a transaction and hold responses until commit. Failed statements roll back before individual retries. An uncertain COMMIT result returns an error without replaying the writes. JWTs are verified on every authenticated request with OpenSSL HMAC-SHA256. Response data is never cached across requests.
+
+ISA-L 2.31.1 compresses responses of at least 1,024 bytes when the client accepts gzip. Compression state and scratch buffers belong to the worker thread. Short responses avoid compression overhead.
+
+## Build and run
+
+`install.sh` installs Zig and the C build tools on Ubuntu. `build.sh` downloads SHA-256-pinned PostgreSQL 18.6 and ISA-L sources, links their static client libraries, and emits `feed-zig`. The PostgreSQL client uses plain TCP on the challenge's private database network. OpenSSL supplies JWT verification.
+
+Set `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, and optional `EXTRA_PORT`, then run `./start.sh` in the foreground.
+
+`DB_POOL` sets the total database connection budget, from 1 through 512. `HTTP_LOOPS` sets the number of epoll loops, defaulting to two when the pool has at least four workers. Each loop needs a read worker. `WRITE_WORKERS` sets the total reserved write workers; use zero to disable reservation, or at least one per loop. Defaults are 16 database workers, two loops, and two write workers.
+
+## Validation
+
+Run the repository API suite against a fresh seed clone, then the regressions:
+
+```sh
+bash test/test.sh http://127.0.0.1:3000
+python3 submissions/zig-kamkm/tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test
+python3 submissions/zig-kamkm/tests/concurrent_writes.py http://127.0.0.1:3000 --database feed_test
+```
+
+The Python probes use the usual `psql` connection environment. Add `--docker CONTAINER` when PostgreSQL runs in Docker.
 
 Front: direct
-
-The feed freshness regression probe can check an external database commit with `python3 tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test`, using the usual PostgreSQL environment variables.

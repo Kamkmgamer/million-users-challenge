@@ -11,12 +11,12 @@ esac
 ARCHIVE="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz"
 URL="https://ziglang.org/download/${ZIG_VERSION}/${ARCHIVE}"
 
-# @cImport needs the PostgreSQL and OpenSSL development headers. The challenge
-# image already has them; this makes a clean Ubuntu image self-contained too.
+# The pinned client libraries need C/assembly tools. OpenSSL headers provide
+# JWT verification. Install them on clean Ubuntu machines.
 if command -v apt-get >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils libpq-dev libssl-dev
+  apt-get install -y -qq --no-install-recommends ca-certificates curl xz-utils gcc make nasm bison flex libssl-dev
 fi
 
 TMP="$(mktemp -d)"

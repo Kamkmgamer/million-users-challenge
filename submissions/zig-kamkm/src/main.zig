@@ -1,9 +1,9 @@
 const std = @import("std");
-const gzip = std.compress.gzip;
 const c = @cImport({
     @cInclude("arpa/inet.h");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
+    @cInclude("igzip_lib.h");
     @cInclude("libpq-fe.h");
     @cInclude("netdb.h");
     @cInclude("netinet/in.h");
@@ -814,21 +814,28 @@ fn jsonEscape(out: *std.ArrayList(u8), value: []const u8) !void {
     }
 }
 
+threadlocal var gzip_buffer: [256 * 1024]u8 = undefined;
+threadlocal var gzip_stream: c.struct_isal_zstream = undefined;
+
 fn responseFor(allocator: Allocator, status: u16, reason: []const u8, body: []const u8, close_after: bool, want_gzip: bool) ![]u8 {
-    var compressed: ?[]u8 = null;
-    defer if (compressed) |buf| allocator.free(buf);
+    var compressed = false;
     var response_body = body;
-    if (want_gzip and body.len >= 64) {
-        var encoded = std.ArrayList(u8).init(allocator);
-        defer encoded.deinit();
-        var input = std.io.fixedBufferStream(body);
-        gzip.compress(input.reader(), encoded.writer(), .{ .level = .fast }) catch return error.Compression;
-        compressed = try encoded.toOwnedSlice();
-        response_body = compressed.?;
+    if (want_gzip and body.len >= 1024 and body.len < gzip_buffer.len - 32) {
+        c.isal_deflate_stateless_init(&gzip_stream);
+        gzip_stream.next_in = @constCast(body.ptr);
+        gzip_stream.avail_in = @intCast(body.len);
+        gzip_stream.next_out = &gzip_buffer;
+        gzip_stream.avail_out = gzip_buffer.len;
+        gzip_stream.gzip_flag = c.IGZIP_GZIP;
+        gzip_stream.level = 0;
+        if (c.isal_deflate_stateless(&gzip_stream) == c.COMP_OK) {
+            compressed = true;
+            response_body = gzip_buffer[0 .. gzip_buffer.len - gzip_stream.avail_out];
+        }
     }
     var out = std.ArrayList(u8).init(allocator);
     errdefer out.deinit();
-    try out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ status, reason, if (compressed != null) "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" else "", response_body.len, if (close_after) "close" else "keep-alive" });
+    try out.writer().print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\nConnection: {s}\r\n\r\n", .{ status, reason, if (compressed) "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" else "", response_body.len, if (close_after) "close" else "keep-alive" });
     try out.appendSlice(response_body);
     return out.toOwnedSlice();
 }
@@ -963,7 +970,8 @@ fn dbConnection(worker: *Worker) ?*c.PGconn {
     return conn;
 }
 
-fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
+fn processRequest(app: *App, worker: *Worker, conn: *Connection, loaded: ?*c.PGresult) ![]u8 {
+    defer if (loaded) |result| c.PQclear(result);
     const raw = conn.read_buf.?[0..conn.read_len];
     const req = parseHttp(raw) orelse return error.MalformedRequest;
     const route = routeFor(req.method, req.path);
@@ -1008,13 +1016,13 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
     switch (route) {
         .feed => {
             const connection = dbConnection(worker) orelse return error.Internal;
-            const res = preparedExec(connection, "feed", &[_][]const u8{}, &[_]c_int{}) orelse return error.Internal;
+            const res = loaded orelse preparedExec(connection, "feed", &[_][]const u8{}, &[_]c_int{}) orelse return error.Internal;
             if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
-                c.PQclear(res);
+                if (loaded == null) c.PQclear(res);
                 return error.Internal;
             }
             const result = res;
-            defer c.PQclear(result);
+            defer if (loaded == null) c.PQclear(result);
             var body = std.ArrayList(u8).init(app.allocator);
             defer body.deinit();
             try body.appendSlice("{\"posts\":[");
@@ -1034,9 +1042,9 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
             const values = [_][]const u8{id_text};
             const lengths = [_]c_int{@intCast(id_text.len)};
             const connection = dbConnection(worker) orelse return error.Internal;
-            const res = preparedExec(connection, "post", &values, &lengths) orelse return error.Internal;
+            const res = loaded orelse preparedExec(connection, "post", &values, &lengths) orelse return error.Internal;
             const result = res;
-            defer c.PQclear(result);
+            defer if (loaded == null) c.PQclear(result);
             if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.Internal;
             if (c.PQntuples(result) == 0) return error.PostNotFound;
             var body = std.ArrayList(u8).init(app.allocator);
@@ -1060,8 +1068,8 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
             const values = [_][]const u8{ user_text, body_slice };
             const lengths = [_]c_int{ @intCast(user_text.len), @intCast(body_slice.len) };
             const connection = dbConnection(worker) orelse return error.Internal;
-            const res = preparedExec(connection, "insert_post", &values, &lengths) orelse return error.Internal;
-            defer c.PQclear(res);
+            const res = loaded orelse preparedExec(connection, "insert_post", &values, &lengths) orelse return error.Internal;
+            defer if (loaded == null) c.PQclear(res);
             if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) return error.Internal;
             const new_id = pgSlice(res, 0, 0);
             const created = pgSlice(res, 0, 1);
@@ -1087,8 +1095,8 @@ fn processRequest(app: *App, worker: *Worker, conn: *Connection) ![]u8 {
             const values = [_][]const u8{ user_text, post_text };
             const lengths = [_]c_int{ @intCast(user_text.len), @intCast(post_text.len) };
             const connection = dbConnection(worker) orelse return error.Internal;
-            const res = preparedExec(connection, "like_post", &values, &lengths) orelse return error.Internal;
-            defer c.PQclear(res);
+            const res = loaded orelse preparedExec(connection, "like_post", &values, &lengths) orelse return error.Internal;
+            defer if (loaded == null) c.PQclear(res);
             if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
                 const state_ptr = c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE);
                 const constraint_ptr = c.PQresultErrorField(res, c.PG_DIAG_CONSTRAINT_NAME);
@@ -1127,11 +1135,7 @@ fn requestRoute(conn: *Connection) Route {
 }
 
 fn completeSingle(worker: *Worker, conn: *Connection) void {
-    if (conn.state == .closed) {
-        worker.complete(conn, null, false);
-        return;
-    }
-    const response = processRequest(worker.app, worker, conn) catch |err| makeErrorFor(worker.app, err, conn.want_gzip) catch null;
+    const response = processRequest(worker.app, worker, conn, null) catch |err| makeErrorFor(worker.app, err, conn.want_gzip) catch null;
     worker.complete(conn, response, false);
 }
 
@@ -1143,18 +1147,44 @@ fn runTransactionCommand(db: *c.PGconn, command: []const u8) bool {
     return ok;
 }
 
+// libpq copies text parameters into its output buffer before returning.
+fn sendWrite(worker: *Worker, db: *c.PGconn, conn: *Connection) !bool {
+    const req = parseHttp(conn.read_buf.?[0..conn.read_len]) orelse return false;
+    var username: [4096]u8 = undefined;
+    const auth = authenticate(worker.app, req.authorization, &username) catch return false;
+    var user_buf: [32]u8 = undefined;
+    const user = try std.fmt.bufPrintZ(&user_buf, "{d}", .{auth.user_id});
+    var second: [MAX_REQUEST + 1]u8 = undefined;
+    const route = routeFor(req.method, req.path);
+    if (route == .create) {
+        var parser = JsonParser{ .data = req.body };
+        if (parser.parseBody(&second) != .ok) return false;
+        second[parser.parsed_len] = 0;
+    } else if (route == .like) {
+        const id = postIdFromPath(req.path, true) orelse return false;
+        _ = try std.fmt.bufPrintZ(&second, "{d}", .{id});
+    } else return false;
+    const values = [_][*c]const u8{ user.ptr, &second };
+    const name: [*:0]const u8 = if (route == .create) "insert_post" else "like_post";
+    if (c.PQsendQueryPrepared(db, name, 2, &values, null, null, 0) != 1) return error.Internal;
+    return true;
+}
+
 fn processWriteBatch(worker: *Worker, first: *Connection) void {
     var batch: [WRITE_BATCH]*Connection = undefined;
-    var responses: [WRITE_BATCH]?[]u8 = undefined;
-    for (&responses) |*response| response.* = null;
+    var responses = [_]?[]u8{null} ** WRITE_BATCH;
+    var results = [_]?*c.PGresult{null} ** WRITE_BATCH;
+    var queued = [_]bool{false} ** WRITE_BATCH;
     batch[0] = first;
     var count: usize = 1;
     while (count < WRITE_BATCH) {
-        const next = worker.tryDequeue() orelse break;
-        batch[count] = next;
+        batch[count] = worker.tryDequeue() orelse break;
         count += 1;
     }
-
+    if (count == 1) {
+        completeSingle(worker, first);
+        return;
+    }
     const db = dbConnection(worker) orelse {
         for (batch[0..count]) |conn| completeSingle(worker, conn);
         return;
@@ -1163,23 +1193,165 @@ fn processWriteBatch(worker: *Worker, first: *Connection) void {
         for (batch[0..count]) |conn| completeSingle(worker, conn);
         return;
     }
-
-    var failed = false;
-    for (batch[0..count], 0..) |conn, index| {
-        responses[index] = processRequest(worker.app, worker, conn) catch {
-            failed = true;
+    var ok = c.PQenterPipelineMode(db) == 1;
+    if (ok) for (batch[0..count], 0..) |conn, i| {
+        queued[i] = sendWrite(worker, db, conn) catch {
+            ok = false;
             break;
         };
+    };
+    if (ok) ok = c.PQpipelineSync(db) == 1;
+    if (ok) for (queued[0..count], 0..) |sent, i| {
+        if (!sent) continue;
+        results[i] = c.PQgetResult(db);
+        if (results[i] == null) {
+            ok = false;
+            break;
+        }
+        if (c.PQgetResult(db)) |extra| {
+            c.PQclear(extra);
+            ok = false;
+            break;
+        }
+    };
+    if (ok) {
+        const sync = c.PQgetResult(db);
+        ok = sync != null and c.PQresultStatus(sync) == c.PGRES_PIPELINE_SYNC;
+        if (sync) |result| c.PQclear(result);
+        if (c.PQgetResult(db)) |extra| {
+            c.PQclear(extra);
+            ok = false;
+        }
+        if (ok) ok = c.PQexitPipelineMode(db) == 1;
     }
-
-    if (!failed and runTransactionCommand(db, "COMMIT")) {
-        for (batch[0..count], 0..) |conn, index| worker.complete(conn, responses[index], false);
+    if (!ok) {
+        // COMMIT was never sent. Closing the connection rolls the group back.
+        for (results[0..count]) |result| if (result) |r| c.PQclear(r);
+        c.PQfinish(db);
+        worker.db = null;
+        worker.prepared = false;
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
         return;
     }
+    var failed = false;
+    for (batch[0..count], 0..) |conn, i| {
+        if (results[i]) |result| {
+            results[i] = null;
+            responses[i] = processRequest(worker.app, worker, conn, result) catch {
+                failed = true;
+                break;
+            };
+        }
+    }
+    for (results[0..count]) |result| if (result) |r| c.PQclear(r);
+    if (failed) {
+        for (responses[0..count]) |response| if (response) |buf| worker.app.allocator.free(buf);
+        if (!runTransactionCommand(db, "ROLLBACK")) {
+            c.PQfinish(db);
+            worker.db = null;
+            worker.prepared = false;
+        }
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
+        return;
+    }
+    const committed = runTransactionCommand(db, "COMMIT");
+    for (batch[0..count], 0..) |conn, i| {
+        if (!committed and queued[i]) {
+            if (responses[i]) |buf| worker.app.allocator.free(buf);
+            // A lost COMMIT acknowledgement is ambiguous. Never replay it.
+            worker.complete(conn, makeErrorFor(worker.app, error.Internal, conn.want_gzip) catch null, false);
+        } else if (responses[i]) |response| worker.complete(conn, response, false) else completeSingle(worker, conn);
+    }
+}
 
-    for (responses[0..count]) |response| if (response) |buf| worker.app.allocator.free(buf);
-    _ = runTransactionCommand(db, "ROLLBACK");
-    for (batch[0..count]) |conn| completeSingle(worker, conn);
+// Every queued request sends its own prepared statement. One Sync terminates
+// the read-only group, amortizing protocol flushes without caching any data.
+fn processReadBatch(worker: *Worker, first: *Connection) void {
+    var batch: [64]*Connection = undefined;
+    var results = [_]?*c.PGresult{null} ** 64;
+    var queued = [_]bool{false} ** 64;
+    batch[0] = first;
+    var count: usize = 1;
+    while (count < batch.len) {
+        batch[count] = worker.tryDequeue() orelse break;
+        count += 1;
+    }
+    if (count == 1) {
+        completeSingle(worker, first);
+        return;
+    }
+    const db = dbConnection(worker) orelse {
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
+        return;
+    };
+    var ok = c.PQenterPipelineMode(db) == 1;
+    if (ok) {
+        for (batch[0..count], 0..) |conn, i| {
+            const req = parseHttp(conn.read_buf.?[0..conn.read_len]) orelse continue;
+            switch (routeFor(req.method, req.path)) {
+                .feed => {
+                    queued[i] = true;
+                    if (c.PQsendQueryPrepared(db, "feed", 0, null, null, null, 0) != 1) {
+                        ok = false;
+                        break;
+                    }
+                },
+                .post => {
+                    const id = postIdFromPath(req.path, false) orelse continue;
+                    var text: [32]u8 = undefined;
+                    const value = std.fmt.bufPrintZ(&text, "{d}", .{id}) catch unreachable;
+                    const values = [_][*c]const u8{value.ptr};
+                    queued[i] = true;
+                    if (c.PQsendQueryPrepared(db, "post", 1, &values, null, null, 0) != 1) {
+                        ok = false;
+                        break;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    if (ok) ok = c.PQpipelineSync(db) == 1;
+    if (ok) {
+        for (queued[0..count], 0..) |sent, i| {
+            if (!sent) continue;
+            results[i] = c.PQgetResult(db);
+            if (results[i] == null) {
+                ok = false;
+                break;
+            }
+            if (c.PQgetResult(db)) |extra| {
+                c.PQclear(extra);
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        const sync = c.PQgetResult(db);
+        ok = sync != null and c.PQresultStatus(sync) == c.PGRES_PIPELINE_SYNC;
+        if (sync) |result| c.PQclear(result);
+        if (c.PQgetResult(db)) |extra| {
+            c.PQclear(extra);
+            ok = false;
+        }
+        if (ok) ok = c.PQexitPipelineMode(db) == 1;
+    }
+    if (!ok) {
+        for (results[0..count]) |result| if (result) |r| c.PQclear(r);
+        c.PQfinish(db);
+        worker.db = null;
+        worker.prepared = false;
+        // Retry only reads; none of these statements can duplicate a write.
+        for (batch[0..count]) |conn| completeSingle(worker, conn);
+        return;
+    }
+    for (batch[0..count], 0..) |conn, i| {
+        if (results[i]) |result| {
+            const response = processRequest(worker.app, worker, conn, result) catch |err| makeErrorFor(worker.app, err, conn.want_gzip) catch null;
+            worker.complete(conn, response, false);
+        } else completeSingle(worker, conn);
+    }
 }
 
 fn workerMain(worker: *Worker) void {
@@ -1190,6 +1362,8 @@ fn workerMain(worker: *Worker) void {
         const route = requestRoute(conn);
         if (is_write_worker and (route == .create or route == .like)) {
             processWriteBatch(worker, conn);
+        } else if (!is_write_worker and (route == .feed or route == .post)) {
+            processReadBatch(worker, conn);
         } else {
             completeSingle(worker, conn);
         }
@@ -1382,26 +1556,61 @@ pub fn main() !void {
     const port = std.fmt.parseInt(u16, envOr("PORT", "3000"), 10) catch return error.Configuration;
     const extra_raw = std.posix.getenv("EXTRA_PORT");
     const extra_port: ?u16 = if (extra_raw) |value| if (value.len > 0) std.fmt.parseInt(u16, value, 10) catch return error.Configuration else null else null;
-    // Match the application pool to the challenge box. The remote staging
-    // host has eight CPUs and naturally settles at eight; the official
-    // sixteen-CPU box gets sixteen independent DB sessions. DB_POOL remains
-    // available for deployments with a different database limit.
+    // Split the total connection budget across the HTTP loops. DB_POOL can
+    // override the default when the database has a different connection limit.
     var workers: usize = 16;
     if (std.posix.getenv("DB_POOL")) |value| workers = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
     if (workers == 0 or workers > 512) return error.Configuration;
 
+    var loops: usize = @min(@as(usize, 2), @max(@as(usize, 1), workers / 2));
+    if (std.posix.getenv("HTTP_LOOPS")) |value| loops = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
+    if (loops == 0 or loops > @max(@as(usize, 1), workers / 2)) return error.Configuration;
+    var writes: usize = if (workers > 1) @max(loops, workers / 8) else 0;
+    if (std.posix.getenv("WRITE_WORKERS")) |value| writes = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
+    if (writes >= workers or (writes != 0 and writes < loops)) return error.Configuration;
+    for (0..loops) |i| {
+        const count = workers / loops + @intFromBool(i < workers % loops);
+        const write_count = writes / loops + @intFromBool(i < writes % loops);
+        if (write_count >= count) return error.Configuration;
+        const config = ServerConfig{ .allocator = allocator, .db_url = db_url, .secret = secret, .host = host, .port = port, .extra_port = extra_port, .workers = count, .writes = write_count };
+        if (i + 1 == loops) try runServer(config) else {
+            const thread = try std.Thread.spawn(.{}, serverThread, .{config});
+            thread.detach();
+        }
+    }
+}
+
+const ServerConfig = struct {
+    allocator: Allocator,
+    db_url: []u8,
+    secret: []u8,
+    host: []const u8,
+    port: u16,
+    extra_port: ?u16,
+    workers: usize,
+    writes: usize,
+};
+
+fn serverThread(config: ServerConfig) void {
+    runServer(config) catch |err| {
+        std.log.err("HTTP loop failed: {}", .{err});
+        std.process.exit(1);
+    };
+}
+
+fn runServer(config: ServerConfig) !void {
+    const allocator = config.allocator;
+    const db_url = config.db_url;
+    const secret = config.secret;
+    const host = config.host;
+    const port = config.port;
+    const extra_port = config.extra_port;
+    const workers = config.workers;
+    const write_worker_count = config.writes;
     const epfd = c.epoll_create1(c.EPOLL_CLOEXEC);
     if (epfd < 0) return error.Epoll;
     const notify = c.eventfd(0, c.EFD_NONBLOCK | c.EFD_CLOEXEC);
     if (notify < 0) return error.Event;
-    // Most challenge traffic is read-heavy. Keep one lane for writes by
-    // default so reads can use nearly the whole pool; deployments with a
-    // write-heavy mix can override this explicitly.
-    var write_worker_count: usize = if (workers > 1) @max(@as(usize, 1), workers / 8) else 0;
-    if (std.posix.getenv("WRITE_WORKERS")) |value| {
-        write_worker_count = std.fmt.parseInt(usize, value, 10) catch return error.Configuration;
-    }
-    if (write_worker_count >= workers) return error.Configuration;
     var app = App{ .allocator = allocator, .epfd = epfd, .notify_fd = notify, .db_url = db_url, .jwt_secret = secret, .workers = &[_]Worker{}, .threads = &[_]std.Thread{}, .write_worker_count = write_worker_count, .started_ns = std.time.nanoTimestamp() };
     app.workers = try allocator.alloc(Worker, workers);
     app.threads = try allocator.alloc(std.Thread, workers);
