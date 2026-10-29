@@ -3,17 +3,13 @@ package main
 import (
 	"context"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 const (
@@ -71,58 +67,11 @@ func main() {
 		ports = append(ports, extra)
 	}
 
-	servers := make([]*fasthttp.Server, len(ports))
-	listeners := make([]net.Listener, len(ports))
-	for i, p := range ports {
-		address := net.JoinHostPort(host, p)
-		listener, listenErr := (&net.ListenConfig{KeepAlive: -1}).Listen(ctx, "tcp", address)
-		if listenErr != nil {
-			log.Fatalf("listen %s: %v", address, listenErr)
-		}
-		listeners[i] = listener
-		servers[i] = &fasthttp.Server{
-			Handler:            fasthttpadaptor.NewFastHTTPHandler(application),
-			Concurrency:        2000000,
-			ReduceMemoryUsage:  true,
-			IdleTimeout:        180 * time.Second,
-			ReadTimeout:        15 * time.Second,
-			ReadBufferSize:     16 << 10,
-			MaxRequestBodySize: maxBodyBytes,
-			CloseOnShutdown:    true,
-			ErrorHandler: func(ctx *fasthttp.RequestCtx, err error) {
-				ctx.SetContentType("application/json")
-				ctx.SetStatusCode(400)
-				ctx.SetBodyString(`{"error":"malformed JSON body"}`)
-			},
-		}
+	log.Printf("go-kamkm event loops listening on %v (postgres pool %d)", ports, poolSize)
+	if err := serveEventHTTP(ctx, application, host, ports); err != nil {
+		log.Printf("HTTP server stopped: %v", err)
 	}
 
-	log.Printf("go-kamkm listening on %v (postgres pool %d)", ports, poolSize)
-	var wait sync.WaitGroup
-	serveErrors := make(chan error, len(servers))
-	for i := range servers {
-		wait.Add(1)
-		go func(index int) {
-			defer wait.Done()
-			if serveErr := servers[index].Serve(listeners[index]); serveErr != nil {
-				serveErrors <- serveErr
-			}
-		}(i)
-	}
-
-	select {
-	case <-ctx.Done():
-	case serveErr := <-serveErrors:
-		log.Printf("HTTP server stopped: %v", serveErr)
-		stop()
-	}
-
-	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, server := range servers {
-		_ = server.ShutdownWithContext(shutdownContext)
-	}
-	wait.Wait()
 	application.writes.close()
 }
 

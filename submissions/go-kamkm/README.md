@@ -1,6 +1,6 @@
 # Go feed server
 
-A Go 1.27.1 submission using fasthttp 1.77.0 and pgx 5.11.0. Both ports share one process. The HTTP transport releases idle request, response, and reader buffers. It keeps connections alive for 180 seconds and disables TCP keep-alive probes.
+A Go 1.27.1 submission using gnet 2.10.0 and pgx 5.11.0. Four epoll event loops serve both ports in one process. Idle connections keep a socket record and timeout, without a goroutine or HTTP buffers. Only active requests start a goroutine. Go's standard HTTP parser handles partial headers, chunked bodies, and pipelining. A connection processes pipelined requests in order. Idle connections have a 180-second timeout; a request has 15 seconds from its first byte.
 
 Eight read workers send batches of up to 64 independent SELECT statements through pgx. Each request executes the SQL from `SPEC.md`; response data and JWT verification results are never cached across requests. The bounded read queue holds at most 1,024 jobs.
 

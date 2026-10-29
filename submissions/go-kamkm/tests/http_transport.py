@@ -50,6 +50,12 @@ for chunk in (body[:5],body[5:]):
  time.sleep(.01)
 s.sendall(b'0\r\n\r\n')
 status,headers,created=response();assert status==201 and created['post']['body']=='chunked transport test',(status,created)
+# An Expect client waits for the interim response before sending its body.
+s.sendall(b'POST /posts HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer '+token+b'\r\nExpect: 100-continue\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n')
+assert r.readline()==b'HTTP/1.1 100 Continue\r\n'
+assert r.readline()==b'\r\n'
+s.sendall(body)
+status,headers,created=response();assert status==201,(status,created)
 # Compressor reuse must produce independent, complete gzip members.
 for _ in range(3):
  s.sendall(b'GET /feed HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n')
