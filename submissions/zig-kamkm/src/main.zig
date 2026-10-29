@@ -150,7 +150,9 @@ const App = struct {
                 if (item.output != null) {
                     item.output_pos = 0;
                     item.state = .writing;
-                    self.modifyConnection(item, c.EPOLLOUT | c.EPOLLERR | c.EPOLLHUP);
+                    if (writeConnection(self, item)) {
+                        self.modifyConnection(item, c.EPOLLOUT | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
+                    }
                 } else {
                     // The worker has finished without a response. Mark it as
                     // event-loop-owned before closing so the connection record
@@ -171,7 +173,7 @@ const App = struct {
 
     fn addConnection(self: *App, conn: *Connection) bool {
         var ev: c.struct_epoll_event = undefined;
-        ev.events = c.EPOLLIN | c.EPOLLERR | c.EPOLLHUP;
+        ev.events = c.EPOLLIN | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP;
         ev.data.ptr = @ptrCast(conn);
         return c.epoll_ctl(self.epfd, c.EPOLL_CTL_ADD, conn.fd, &ev) == 0;
     }
@@ -1438,7 +1440,6 @@ fn dispatchIfComplete(app: *App, conn: *Connection) void {
     if (headerComplete(raw)) |needed| {
         if (needed <= raw.len) {
             conn.state = .processing;
-            app.modifyConnection(conn, c.EPOLLERR | c.EPOLLHUP);
             app.enqueue(conn);
         }
     }
@@ -1478,13 +1479,16 @@ fn readConnection(app: *App, conn: *Connection) void {
         app.closeConnection(conn);
         return;
     }
+    app.modifyConnection(conn, c.EPOLLIN | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
 }
 
-fn writeConnection(app: *App, conn: *Connection) void {
-    if (conn.state != .writing) return;
+// Return true only when a partial send needs another writable event. A false
+// result may have freed conn, so callers must not inspect it afterward.
+fn writeConnection(app: *App, conn: *Connection) bool {
+    if (conn.state != .writing) return false;
     const buf = conn.output orelse {
         app.closeConnection(conn);
-        return;
+        return false;
     };
     while (conn.output_pos < buf.len) {
         const n = c.send(conn.fd, @ptrCast(buf.ptr + conn.output_pos), buf.len - conn.output_pos, c.MSG_NOSIGNAL);
@@ -1492,9 +1496,9 @@ fn writeConnection(app: *App, conn: *Connection) void {
             conn.output_pos += @intCast(n);
             continue;
         }
-        if (n < 0 and (c.__errno_location().* == c.EAGAIN or c.__errno_location().* == c.EWOULDBLOCK)) return;
+        if (n < 0 and (c.__errno_location().* == c.EAGAIN or c.__errno_location().* == c.EWOULDBLOCK)) return true;
         app.closeConnection(conn);
-        return;
+        return false;
     }
     app.allocator.free(buf);
     conn.output = null;
@@ -1506,10 +1510,11 @@ fn writeConnection(app: *App, conn: *Connection) void {
     conn.read_len = 0;
     if (conn.close_after) {
         app.closeConnection(conn);
-        return;
+        return false;
     }
     conn.state = .open;
-    app.modifyConnection(conn, c.EPOLLIN | c.EPOLLERR | c.EPOLLHUP);
+    app.modifyConnection(conn, c.EPOLLIN | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
+    return false;
 }
 
 fn runLoop(app: *App, listeners: []const c_int) !void {
@@ -1521,11 +1526,12 @@ fn runLoop(app: *App, listeners: []const c_int) !void {
             return error.Epoll;
         }
         var i: c_int = 0;
+        var completions_ready = false;
         while (i < n) : (i += 1) {
             const ev = events[@intCast(i)];
             const tag = ev.data.u64;
             if (tag == @as(u64, @intCast(app.notify_fd))) {
-                app.drainCompletions();
+                completions_ready = true;
                 continue;
             }
             var is_listener = false;
@@ -1541,8 +1547,15 @@ fn runLoop(app: *App, listeners: []const c_int) !void {
                 continue;
             }
             if ((ev.events & c.EPOLLIN) != 0) readConnection(app, conn);
-            if ((ev.events & c.EPOLLOUT) != 0) writeConnection(app, conn);
+            if ((ev.events & c.EPOLLOUT) != 0) {
+                if (writeConnection(app, conn)) {
+                    app.modifyConnection(conn, c.EPOLLOUT | c.EPOLLONESHOT | c.EPOLLERR | c.EPOLLHUP);
+                }
+            }
         }
+        // Process socket hangups before completions can send and free their
+        // connection records. The current event batch may still reference them.
+        if (completions_ready) app.drainCompletions();
     }
 }
 

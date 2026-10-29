@@ -2,12 +2,14 @@
 """Exercise fragmented requests, large headers and UTF-8 bodies over keep-alive."""
 import argparse
 import base64
+from contextlib import closing
 import hashlib
 import hmac
 import http.client
 import json
 import os
 import socket
+import struct
 import time
 from urllib.parse import urlsplit
 
@@ -72,4 +74,15 @@ with socket.create_connection((base.hostname, base.port), timeout=10) as connect
     except ConnectionResetError:
         pass
 
-print('PASS: buffer boundaries, fragmented headers/body, UTF-8, keep-alive and request limit')
+# Resets can race database completions; later requests must still work.
+for _ in range(512):
+    with socket.create_connection((base.hostname, base.port), timeout=10) as connection:
+        connection.sendall(b'GET /feed HTTP/1.1\r\nHost: localhost\r\n\r\n')
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+with closing(http.client.HTTPConnection(base.hostname, base.port, timeout=10)) as connection:
+    connection.request('GET', '/posts/1')
+    response = connection.getresponse()
+    assert response.status == 200
+    assert json.loads(response.read())['post']['id'] == 1
+
+print('PASS: buffer boundaries, fragmented headers/body, UTF-8, keep-alive, request limit and resets')
