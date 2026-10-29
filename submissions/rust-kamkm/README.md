@@ -32,4 +32,8 @@ python3 submissions/rust-kamkm/tests/http_transport.py http://127.0.0.1:3000 --i
 
 The database probes use the usual `psql` connection environment, or `--docker CONTAINER`.
 
+## Measurements
+
+See [BENCHMARKS.md](BENCHMARKS.md) for the remote before/after tests, the matched C comparison, and the sustained connection test. [benchmark-results.json](benchmark-results.json) records the measured metrics and executable hashes.
+
 Front: direct
