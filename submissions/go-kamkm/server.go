@@ -39,9 +39,6 @@ type application struct {
 	writes  *writeBatcher
 	secret  []byte
 	started time.Time
-	feedMu  sync.RWMutex
-	feedRaw []byte
-	feedAt  time.Time
 }
 
 type postJSON struct {
@@ -153,14 +150,6 @@ func (a *application) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *application) feed(w http.ResponseWriter, r *http.Request) {
-	a.feedMu.RLock()
-	if len(a.feedRaw) > 0 && time.Since(a.feedAt) < time.Second {
-		body := append([]byte(nil), a.feedRaw...)
-		a.feedMu.RUnlock()
-		writeBody(w, r, http.StatusOK, body)
-		return
-	}
-	a.feedMu.RUnlock()
 	ctx, cancel := queryContext(r.Context())
 	defer cancel()
 	rows, err := a.db.Query(ctx, postQuery+" ORDER BY p.created_at DESC, p.id DESC LIMIT $1", feedLimit)
@@ -188,12 +177,6 @@ func (a *application) feed(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
-	a.feedMu.Lock()
-	if len(a.feedRaw) == 0 || time.Since(a.feedAt) >= time.Second {
-		a.feedRaw = append(a.feedRaw[:0], body...)
-		a.feedAt = time.Now()
-	}
-	a.feedMu.Unlock()
 	writeBody(w, r, http.StatusOK, body)
 }
 
@@ -234,7 +217,6 @@ func (a *application) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, r, http.StatusInternalServerError, errorEnvelope{Error: "internal server error"})
 		return
 	}
-	a.invalidateFeed()
 	writeJSON(w, r, http.StatusCreated, postEnvelope{Post: result.post})
 }
 
@@ -463,13 +445,6 @@ func writeBody(w http.ResponseWriter, r *http.Request, status int, body []byte) 
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
 	_, _ = w.Write(body)
-}
-
-func (a *application) invalidateFeed() {
-	a.feedMu.Lock()
-	a.feedRaw = nil
-	a.feedAt = time.Time{}
-	a.feedMu.Unlock()
 }
 
 func acceptsGzip(value string) bool {

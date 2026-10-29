@@ -15,4 +15,6 @@ The process consumes `DATABASE_URL`, `JWT_SECRET`, `HOST`, `PORT`, `EXTRA_PORT`,
 - Database statements are the queries from `SPEC.md`, issued through one shared pool. Query contexts have a five-second bound, and missing-post likes are translated from the post foreign-key error.
 - Authenticated writes enter a bounded 64-item batcher and share one transaction/commit; a failed batch is rolled back and retried individually so per-request errors remain correct.
 - Responses use ordered Go structs and UTC millisecond formatting. Gzip response buffers and writers are pooled only for the duration of a response, so idle keep-alive connections do not retain compression state.
-- The hot feed response is cached per process for one second and invalidated when a post is created, avoiding a database round trip during read bursts.
+- Every request queries PostgreSQL; response data is never cached across requests.
+
+The feed freshness regression probe can check an external database commit with `python3 tests/feed_freshness.py http://127.0.0.1:3000 --database feed_test`, using the usual PostgreSQL environment variables.
