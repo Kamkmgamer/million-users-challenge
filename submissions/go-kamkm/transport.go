@@ -174,7 +174,7 @@ func serveEventHTTP(ctx context.Context, app *application, host string, ports []
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- gnet.Rotate(server, addresses, gnet.WithNumEventLoop(4), gnet.WithReusePort(true), gnet.WithTCPNoDelay(gnet.TCPNoDelay), gnet.WithTCPKeepAlive(0))
+		done <- gnet.Rotate(server, addresses, gnet.WithNumEventLoop(4), gnet.WithReuseAddr(true), gnet.WithReusePort(true), gnet.WithTCPNoDelay(gnet.TCPNoDelay), gnet.WithTCPKeepAlive(0))
 	}()
 	var engine gnet.Engine
 	select {
