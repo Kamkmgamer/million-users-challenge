@@ -2,7 +2,7 @@
 
 Final measured source: `43fa94d8b9b383b03d78d209c99671cfffe09c4f`. The adjacent JSON records the deployed executable SHA-256.
 
-Measured on 2026-10-29. `host-01` has 10 Xeon Platinum 8260 vCPUs and 12 GB RAM and runs both the app and PostgreSQL 18.6. The separate load generator has 8 vCPUs and 16 GB RAM. Network RTT between them is about 0.2 ms. These are remote development measurements, not an official leaderboard score.
+Measured on 2026-10-29. The application and PostgreSQL 18.6 ran on the same 10-vCPU, 12-GB host, and a separate 8-vCPU, 16-GB host ran the load generator. Network RTT between the two hosts is about 0.2 ms. These are development measurements, not an official leaderboard score.
 
 Every run uses a fresh clone of the same seed: 50,000 users, 500,000 posts, and 2,016,005 likes. The SQL, schema, data, 20,000 signed seed tokens, and database configuration are shared across candidates. Durability remains enabled: `fsync=on` and `synchronous_commit=on`. PostgreSQL uses `shared_buffers=2GB`, `effective_cache_size=8GB`, `random_page_cost=1.1`, `effective_io_concurrency=200`, `jit=off`, `enable_memoize=off`, `max_connections=600`, `checkpoint_timeout=15min`, and `max_wal_size=8GB`.
 
